@@ -1,0 +1,883 @@
+SPECTER
+
+Ignotus Nemo
+
+Version 1.0
+23 March, 2026
+
+/****/ Introduction /****/
+
+I call my proposal Specter because, like a ghost, authorization in this
+system exists but cannot be seen. There are no signatures. No public keys.
+Only proofs of identity-bound authorization that leave no trace.
+
+Bitcoin requires every node to download and verify every signature ever
+made. This is already painful. With post-quantum cryptography, signatures
+become 30-40 times larger. The chain bloats to absurdity. Worse, every
+signature reveals a public key, which reveals identity linkage. Privacy
+dies in plain sight.
+
+Specter takes a different path. I do not compress signatures. I
+eliminate them entirely.
+
+/****/ The Core Idea /****/
+
+Instead of proving "this signature is valid for this key," I prove:
+
+  "A transaction was authorized by an identity consistent with an
+   on-chain commitment, bound to this specific transaction, with
+   replay protection."
+
+This is a semantic shift. Authorization becomes a zero-knowledge
+statement about identity, not a verification of a signature algorithm.
+
+The insight comes from observing what signatures actually do:
+
+  1. Prove knowledge of a secret key
+  2. Bind that knowledge to a specific message
+  3. Prevent replay (via nonces or UTXO consumption)
+
+All three can be achieved with hash-based zero-knowledge proofs.
+No elliptic curve discrete log. No lattice problems. Just hashes.
+
+/****/ Identity Without Keys /****/
+
+Each user holds a Root Entropy Value (REV). This is their master secret.
+- From it, I derive everything:
+
+  Identity Commitment:   ID = H(REV || salt || "specter.identity")
+  Authorization:         Auth = H(REV || tx_hash || context || nonce)
+  Nullifier:             N = H(REV || commitment || "specter.nullifier")
+
+The Identity Commitment goes on-chain. It is the only public anchor to
+the user's identity. The REV never leaves the user's control.
+
+When spending, the user proves in zero knowledge:
+
+  C1. "I know REV such that ID = H(REV || salt || domain)"
+  C2. "I have bound this proof to this specific transaction"
+  C3. "My nullifier is derived from the commitment being spent,
+       using my REV, and is fresh (not used before)"
+  C4. "All domain tags are consistent"
+
+Four constraints. That is all.
+
+The user generates this proof locally. The proof, not the secret,
+is what enters the network. The REV never leaves the user's device.
+
+/****/ Why STARKs /****/
+
+I reject trusted setup. This is non-negotiable.
+
+Groth16 requires ceremonies. BN254 curves are not quantum-safe.
+These are disqualifying properties for a system meant to last.
+
+STARKs are transparent. No trusted setup. No pairings. Just hash
+functions and polynomial commitments via FRI. Under standard
+assumptions about collision-resistant hashing, they provide
+post-quantum security.
+
+The trade-off: STARK proofs are larger than SNARKs. A single
+per-transaction proof will be 30-50 KB. This is larger than a
+post-quantum signature (Dilithium at 2.4 KB, SPHINCS+ at 8-49 KB).
+I accept this trade-off because the proof carries more than a
+signature ever could: it proves ownership, authorization, balance
+conservation, range validity, and nullifier correctness. All in one.
+No public key is ever revealed. No identity is ever linked.
+
+The cost is manageable. Each user generates a 30-50 KB proof when
+sending a transaction. Nodes verify each proof individually -- at
+under 5 ms per proof, a block of 500 transactions takes about one
+second of parallel verification on commodity hardware.
+
+/****/ Proving System: Plonky3 over BabyBear /****/
+
+I use Plonky3 as the proving backend with the BabyBear field
+(p = 2^31 - 2^27 + 1 = 2,013,265,921). This is a deliberate
+departure from earlier designs that considered Winterfell over
+Goldilocks. The reasons:
+
+  1. BabyBear is a 31-bit field. Field multiplications take ~0.4
+     cycles with SIMD (AVX-512 or NEON). Goldilocks is 64-bit,
+     roughly 2-4x slower per operation. Every field operation in
+     trace building, FFT, constraint evaluation, and FRI benefits
+     from this.
+
+  2. Plonky3 has native GPU support via ICICLE (CUDA, Metal, CPU
+     backends). ICICLE-Plonky3 achieves 3-7x speedup over CPU SIMD
+     for NTT and constraint evaluation. Winterfell has no GPU path.
+
+  3. The ecosystem is consolidating around BabyBear. SP1 (Succinct),
+     RISC Zero, and Polygon Miden (migrating from Winterfell to
+     Plonky3) all use BabyBear. Building on the same field means
+     access to optimized libraries, audited code, and ongoing
+     community investment.
+
+  4. Plonky3 supports six hash functions for Merkle commitments
+     (Poseidon2, Poseidon, Blake3, Keccak, Rescue, Monolith). I
+     use Poseidon2 for in-circuit hashing and Blake3 for Merkle
+     tree commitments, a hybrid approach that reduces proving time
+     by ~50% for the commitment phase while keeping the circuit
+     arithmetic-friendly.
+
+  5. BabyBear requires a degree-4 (quartic) extension for 128-bit
+     security (4 x 31 = 124 bits). This is constructed as a tower
+     of two quadratic extensions. Most prover work stays in the
+     31-bit base field. Extension field operations are used only
+     for challenge generation and FRI folding.
+
+  6. BabyBear's two-adicity is 2^27, supporting NTT domains of up
+     to 134 million rows. More than sufficient for any single
+     transaction trace.
+
+The performance implications are concrete. On an Apple M3 Pro,
+Plonky3 proves ~1.7 million Poseidon2 hashes per second. A
+Specter transaction proof requires roughly 10-20 Poseidon2
+evaluations in-circuit, placing proving time well under 1 second
+on modern hardware.
+
+/****/ A Note on Zero Knowledge /****/
+
+Standard STARK constructions provide computational integrity but not
+zero knowledge by default. The proof may leak information about the
+witness. For a privacy system, this is unacceptable.
+
+Plonky3 is a modular toolkit. It provides succinctness and soundness,
+but the zero-knowledge property must be explicitly constructed. I
+achieve this through the rigorous masking technique formalized by
+Habook and Al Kindi (ePrint 2024/1037):
+
+First, witness masking: for each trace column polynomial, I add a
+random low-degree polynomial that vanishes on the trace domain H.
+This randomizes polynomial evaluations outside H -- crucially, on
+the larger LDE domain where Merkle commitments are made -- without
+affecting constraint satisfaction within H.
+
+Second, DEEP composition polynomial masking: an additional random
+low-degree polynomial is added to the final DEEP composition
+polynomial, preventing information leakage through the constraint
+evaluation channel.
+
+The number of masking coefficients h is determined by:
+
+  h >= 2 * S * (e * n_D + n_F) + n_F
+
+Where S is the quotient splitting factor (2), e is the extension
+field degree (4 for BabyBear), n_D is the number of DEEP queries
+(1), and n_F is the number of FRI queries (~50 at our security
+level). This yields h ~ 500 random coefficients -- negligible
+compared to trace lengths of thousands of rows.
+
+The overhead is under 5% additional proving time and negligible
+proof size increase.
+
+With both masking layers applied, the underlying IOP achieves
+honest-verifier zero knowledge (HVZK). The Fiat-Shamir
+transformation replacing verifier challenges with hash function
+outputs - upgrades HVZK to full computational zero knowledge in
+the Random Oracle Model. Because the hash function produces
+unpredictable, non-manipulable challenges, a malicious verifier
+cannot adaptively choose challenges to extract information.
+
+This is not hand-waved. The construction follows Habook-Kindi's
+proof, which explicitly treats the subtlety of quotient polynomial
+decomposition - "a source for mistakes, both in literature as well
+as in software implementations."
+
+Private witness data (REV, blinding factors, values) never appears
+directly in the trace. The trace contains only intermediate hash
+states and commitments. The STARK proves relationships between
+these intermediates, not the raw secrets.
+
+/****/ User-Side Proving /****/
+
+Each user generates their own STARK proof when creating a transaction.
+This is the critical architectural decision that distinguishes Specter
+from systems where block producers generate proofs.
+
+When a user creates a transaction, their wallet:
+
+  1. Builds an execution trace for the single transaction
+  2. Includes all constraints (C1-C4, balance, range proofs)
+  3. Applies witness masking and DEEP composition masking
+  4. Generates a STARK proof (~30-50 KB)
+  5. Discards the witness data (REV, values, blinding factors)
+  6. Broadcasts the transaction WITH the proof attached
+
+The proven transaction enters the network. It contains:
+
+  - Input commitments (what is being spent)
+  - Output commitments (what is being created)
+  - Nullifiers (to prevent replay)
+  - The STARK proof of validity
+
+No witness data. No private information. The proof attests to
+correctness without revealing anything about the user's identity
+or the transaction values.
+
+This design eliminates the privacy leak inherent in miner-side
+proving, where the block producer must see all witness data. In
+Specter, the only entity that ever sees the REV is the user's
+own wallet.
+
+Proof generation takes under 1 second on a modern multi-core CPU
+with Plonky3 over BabyBear. For GPU-equipped machines, sub-500ms
+is achievable via ICICLE. For low-powered devices, proof
+generation can be delegated to a trusted prover service, though
+this requires sharing witness data with that service. The
+trade-off is the user's to make.
+
+The proof statement for a single transaction covers:
+
+  - Ownership claim is valid (C1)
+  - Authorization is bound to this transaction (C2)
+  - Nullifiers are correctly derived (C3)
+  - Domain tags match (C4)
+  - Sum of input values equals sum of output values plus fee
+  - All values are in valid range (non-negative, 64-bit)
+
+/****/ Multi-Input Privacy /****/
+
+When a user spends multiple UTXOs in a single transaction, all
+nullifiers appear together, revealing they are controlled by the
+same spender. This is the common-input-ownership linkage that
+Zcash's Sapling protocol also exhibits.
+
+I mitigate this through two mechanisms:
+
+First, each UTXO has its own derived spending secret (derived_rev),
+not the master REV. The proof demonstrates knowledge of derived_rev
+for each input independently. An observer sees multiple nullifiers
+in the same transaction but cannot determine whether they come from
+the same master identity or multiple cooperating parties.
+
+Second, the wallet implements a coin selection policy that minimizes
+multi-input transactions. When possible, a single UTXO of sufficient
+value is selected. The wallet avoids gratuitous consolidation.
+
+For users requiring stronger unlinkability, individual transactions
+can be submitted separately at different times, each spending a
+single input. The trade-off is higher total fees and multiple proof
+generation rounds.
+
+This is an honest acknowledgment: multi-input transactions within
+a single proof do create a statistical linkage signal. Perfect
+unlinkability in multi-input transactions requires either dummy
+inputs (as in Zcash Orchard's action model) or separate proofs.
+Both are possible future extensions.
+
+/****/ Block Production /****/
+
+Proven transactions arrive at the mempool. Nodes verify each proof
+before acceptance. Invalid proofs are rejected immediately. This
+proof-of-work-before-inclusion is the primary anti-spam mechanism:
+generating a valid proof is computationally expensive for the sender.
+
+The block producer collects verified transactions, packages them
+into a block, and searches for a valid PoW nonce. The block
+contains the transactions with their individual proofs. Verifying
+nodes check each per-transaction proof (parallelizable, under 5 ms
+each).
+
+The block producer does not need witness data. It does not need to
+re-prove any transaction. It only verifies existing proofs and
+assembles the block. No trust required.
+
+/****/ Non-Interactive Transactions /****/
+
+Specter uses hash-based stealth addresses. The classical approach
+uses elliptic curve Diffie-Hellman, which is not post-quantum safe.
+I replace it with a hash-based scheme.
+
+Each receiver holds two secrets derived from their seed:
+
+  spend_root:  Used to derive spending authority
+  scan_secret: Used to detect incoming payments
+
+The receiver publishes a stealth meta-address:
+
+  SMA = H(spend_root || H(scan_secret) || "specter.stealth")
+
+The sender creates a one-time output:
+
+  r <- random (ephemeral secret)
+  shared_key = H(r || SMA)
+  one_time_identity = H(shared_key || counter || spend_root_hash)
+
+Where spend_root_hash = H(spend_root) is the public component of
+the SMA. The one_time_identity serves as the identity commitment
+for this output.
+
+The sender encrypts the ephemeral secret r using a key derived from
+H(r || H(scan_secret)):
+
+  hint_key = H(r || H(scan_secret))
+  view_tag = first_byte(hint_key)
+  encrypted_hint = Encrypt(hint_key, r || counter)
+
+The encrypted hint and the 1-byte view tag go on-chain alongside
+the output commitment.
+
+/****/ View Tags: Scanning Optimization /****/
+
+Without optimization, the receiver must attempt full decryption
+of every output hint in every block. This is O(n) in the number
+of transactions on-chain - expensive at scale.
+
+View tags reduce this cost dramatically. The 1-byte view tag is
+derived from the hint key. The receiver computes the candidate
+hint key for each output (a single hash operation) and checks
+whether its first byte matches the on-chain view tag:
+
+  - If it does NOT match (probability 255/256 = 99.6%), skip.
+  - If it does match (probability 1/256 = 0.4%), proceed with
+    full decryption.
+
+This reduces the computational cost of scanning by approximately
+6x for the cryptographic operations alone. Monero, which pioneered
+view tags in August 2022, reports a real-world wallet sync time
+reduction of over 40%.
+
+The security trade-off is minimal: revealing 1 byte of the shared
+secret reduces the privacy margin from 128 bits to 120 bits. This
+is acceptable.
+
+The receiver scans:
+
+  For each output:
+    1. Compute candidate hint_key = H(attempt || H(scan_secret))
+    2. Compare first byte against on-chain view_tag
+    3. If mismatch, skip (99.6% of outputs)
+    4. If match, decrypt hint
+    5. If decryption succeeds, recover r and counter
+    6. Derive shared_key = H(r || SMA)
+    7. Derive one_time_identity = H(shared_key || counter || spend_root_hash)
+    8. Check if one_time_identity matches an output's identity commitment
+
+If it matches, the output belongs to them.
+
+To SPEND the output, the receiver derives the spending secret:
+
+  derived_rev = H(spend_root || shared_key || counter || "specter.spend")
+
+This derived_rev acts as the REV for this specific output. The
+receiver can prove C1 (knowledge of derived_rev such that the
+one_time_identity commitment is valid) in zero knowledge.
+
+This scheme relies only on hash functions and symmetric encryption.
+No elliptic curves. No lattice key exchange. Post-quantum safe by
+construction.
+
+/****/ Value Commitments /****/
+
+I use hash-based commitments instead of Pedersen commitments:
+
+  C = H(v || r || "specter.value")
+
+Where v is the value (64-bit unsigned integer), r is the blinding
+factor (256-bit), and the domain tag provides separation from other
+uses of the hash function. All inputs are fixed-length encoded.
+
+This is computationally hiding and computationally binding under
+collision resistance of H. Post-quantum safe.
+
+The cost: I lose additive homomorphism. I cannot check
+Sum(inputs) = Sum(outputs) by simply adding commitment points.
+Instead, balance verification happens inside the STARK proof.
+The prover demonstrates in zero knowledge that the committed
+values satisfy the conservation equation. The verifier never
+sees the values, only the proof.
+
+This is simpler than it sounds. The STARK already processes
+the transaction. Adding a running sum constraint costs a
+handful of additional trace columns and constraints.
+
+Range proofs also move inside the STARK. Each value is
+decomposed into bits within the execution trace, and the
+constraints verify that the bit decomposition is correct
+and the value is non-negative. This replaces Bulletproofs
+or similar external range proof systems with a few hundred
+constraints per value.
+
+The result: no elliptic curves anywhere in the system. The
+entire protocol is hash-based. Post-quantum security is not
+a retrofit. It is the foundation.
+
+/****/ The Nullifier Set /****/
+
+Each spent output produces a nullifier:
+
+  N = H(REV || commitment || "specter.nullifier")
+
+Where REV is the spending secret for this output (either the
+master REV or a derived_rev from a stealth output), commitment
+is the value commitment being spent, and the domain tag ensures
+separation.
+
+The nullifier is deterministic: the same output always produces
+the same nullifier when spent by the same owner. But an observer
+cannot compute the nullifier without knowing the REV, so they
+cannot determine which output was spent.
+
+Nullifiers are stored in an indexed Merkle tree. When spending,
+the user proves inside their STARK proof that the nullifier is
+correctly derived. After spending, the block producer adds the
+nullifier to the tree.
+
+Why indexed Merkle trees instead of sparse Merkle trees? A sparse
+Merkle tree with 256-bit keys requires 256 hash operations per
+non-membership proof inside a ZK circuit. An indexed Merkle tree
+uses a sorted linked-list structure where non-membership is proven
+by showing a "low nullifier" whose value is less than the target
+and whose next-pointer points to a value greater than the target.
+This requires only a membership proof of the low nullifier (at
+tree depth ~32) plus a range check. Roughly 8x fewer hashes.
+
+Both Aztec and Nomos have independently arrived at this same
+conclusion. When two teams solving the same problem converge on
+the same answer, pay attention.
+
+This prevents double-spending without revealing which output was
+spent. Only the owner knows the mapping from commitment to nullifier.
+
+/****/ Chain Growth: The Critical Problem /****/
+
+A naive design where every proof is stored forever is fatal. At
+500 transactions per block with 50 KB proofs each, that is 25 MB
+of proofs per block. At 720 blocks per day (120-second block time),
+that is 18 GB per day of proof data alone. No blockchain survives
+this.
+
+I solve this through four complementary mechanisms:
+
+  1. Proof Pruning
+  2. Cut-Through
+  3. UTXO Set Accumulator (Utreexo-style)
+  4. Tiered Node Architecture
+
+Together, these reduce Specter's steady-state chain growth to
+well below Bitcoin's ~250 MB/day.
+
+/****/ Proof Pruning /****/
+
+A STARK proof exists to convince verifiers that a state transition
+is valid. Once the transition is accepted into consensus and buried
+under sufficient proof of work, the proof has served its purpose.
+It is redundant.
+
+After N confirmations (N = 1440, approximately 48 hours of blocks),
+full nodes may discard the proof portion of each transaction. The
+verified result -- the state transition itself (nullifiers added,
+outputs committed) -- is permanent. The proof that justified it is
+ephemeral.
+
+What remains per transaction after pruning:
+
+  - Input references (nullifiers + commitment refs): ~128 bytes
+  - Output commitments (identity + value + hint + view tag): ~200 bytes
+  - Transaction kernel (fee): ~32 bytes
+  - Total per transaction: ~360 bytes
+
+Compare this to the pre-pruning state:
+
+  - Transaction body: ~360 bytes
+  - STARK proof: ~30-50 KB
+  - Total per transaction: ~30-50 KB
+
+Pruning reduces per-transaction storage by 98-99%.
+
+After pruning, 500 transactions per block occupy ~180 KB of
+permanent data. At 720 blocks per day, that is ~130 MB/day.
+This is below Bitcoin's ~250 MB/day.
+
+New nodes syncing from genesis have two options:
+
+  1. Full sync: Download all blocks including proofs (available
+     from archive nodes), verify every proof, then prune. This
+     is the trustless path.
+
+  2. Checkpoint sync: Download a verified UTXO set snapshot at
+     a recent checkpoint, download block headers from genesis to
+     verify the PoW chain, then sync recent blocks with proofs.
+     This is analogous to Bitcoin's assumeUTXO.
+
+Archive nodes retain all proofs permanently for historical
+auditability. They are not required for consensus participation.
+
+/****/ Cut-Through /****/
+
+If an output is created and spent within the same block,
+both can be eliminated:
+
+  Before: A -> B -> C
+  After:  A -> C
+
+The intermediate output B never needs to exist on-chain. This
+reduces block size and state bloat.
+
+Cut-through also applies across blocks during pruning. Once both
+the creating transaction and the spending transaction have been
+pruned (proofs discarded), the intermediate output can be removed
+from the permanent record entirely. Only the nullifier (proving
+it was spent) and the final unspent outputs remain.
+
+Over time, the permanent chain state converges toward:
+
+  - Block headers
+  - Transaction kernels (fee records)
+  - Unspent output commitments
+  - The nullifier set
+
+This is structurally similar to Mimblewimble's long-term state,
+where cut-through achieves ~98% data reduction over time. Specter
+achieves comparable compression through proof pruning plus
+cut-through.
+
+/****/ UTXO Set Accumulator /****/
+
+The UTXO set grows monotonically (new outputs minus spent outputs).
+Bitcoin's UTXO set is ~11 GB as of 2025 with ~173 million entries.
+Storing the full set is burdensome for resource-constrained nodes.
+
+Specter uses a Merkle Mountain Range (MMR) accumulator for the
+UTXO set, inspired by Utreexo. Full nodes maintain the complete
+UTXO set and MMR. Compact nodes store only the MMR roots -- less
+than 1 KB of data -- and verify inclusion proofs provided by peers
+or by the spender.
+
+When spending a UTXO, the wallet includes a short MMR inclusion
+proof (~500 bytes) alongside the transaction. This proof
+demonstrates that the referenced output exists in the UTXO set
+without requiring the verifier to store the full set.
+
+This creates a spectrum of node types:
+
+  - Archive nodes: Full blocks, all proofs, full UTXO set
+  - Full nodes: Full blocks (pruned proofs), full UTXO set
+  - Compact nodes: Block headers + UTXO MMR roots (<1 KB state)
+  - Light nodes: Block headers only (SPV-equivalent)
+
+/****/ Chain Growth Summary /****/
+
+                      Before pruning    After pruning    Bitcoin
+Per-block data        ~25 MB            ~180 KB          ~1.7 MB
+Per-day growth        ~18 GB            ~130 MB          ~250 MB
+Per-year growth       ~6.6 TB           ~47 GB           ~91 GB
+5-year chain size     ~33 TB            ~237 GB          ~450 GB
+
+Specter's pruned chain growth (~130 MB/day) is approximately half
+of Bitcoin's growth rate. Archive nodes storing full proofs will
+require substantially more storage, but they are a specialized
+role, not a requirement for network participation.
+
+/****/ Concrete Hash Function: Poseidon2 over BabyBear /****/
+
+Throughout this paper, H denotes Poseidon2 over the BabyBear field
+(p = 2^31 - 2^27 + 1 = 2,013,265,921). Poseidon2 was chosen for
+three reasons:
+
+  1. ZK-friendly: ~126 constraints per invocation inside a STARK
+     over BabyBear (width 16, rate 8, 8 external rounds, 13
+     internal rounds, S-box x^7). Up to 4x fewer constraints than
+     original Poseidon.
+
+  2. Security: 128-bit collision resistance with well-studied
+     algebraic properties. The quartic extension of BabyBear
+     provides ~124 bits of field security.
+
+  3. Performance: 31-bit field multiplications are ~4x cheaper
+     than 64-bit (Goldilocks) on standard hardware. The 13
+     partial rounds (vs 22 for Goldilocks Poseidon2) compound
+     this advantage.
+
+For Merkle tree commitments during proving, Blake3 is used for
+the upper tree levels (not re-proved inside the STARK). Poseidon2
+is used for leaf-level hashing (proved inside the STARK). This
+hybrid approach reduces commitment time by approximately 50%.
+
+For non-ZK uses (symmetric encryption in stealth hints, general
+data hashing, block header hashing), Blake3 is used for its
+native speed (~3-8 GB/s single-threaded).
+
+/****/ Consensus /****/
+
+Proof-of-work using RandomX. CPU-friendly. ASIC-resistant.
+Decentralized mining accessible to commodity hardware.
+
+RandomX uses randomized code execution with memory-hard techniques
+to minimize the efficiency advantage of specialized hardware. It
+requires 2 GB of memory and relies on CPU features (branch prediction,
+cache hierarchy, speculative execution) that are expensive to
+replicate in ASICs or FPGAs.
+
+The block producer:
+
+  1. Collects proven transactions from the mempool
+  2. Verifies each per-transaction STARK proof
+  3. Assembles block with proven transactions
+  4. Finds valid RandomX nonce
+  5. Broadcasts block
+
+The miner does not generate individual transaction proofs. It does
+not see witness data. It does not know who authorized what. It only
+knows that each transaction's proof verified successfully.
+
+Proof generation cost is borne by the sender. Generating a valid
+STARK proof costs under 1 second of CPU time with Plonky3 over
+BabyBear. This is the natural anti-spam mechanism: the
+computational cost of proof generation prevents transaction
+flooding more effectively than fee-based rate limiting alone.
+
+Block time: 120 seconds. This provides room for proof verification,
+block propagation across the network, and reduces chain growth.
+At 500 transactions per block, the sustained throughput is about
+4 transactions per second.
+
+Difficulty adjustment: every 360 blocks (~12 hours). Simple
+moving average of block times. Max adjustment 4x up or down.
+
+/****/ Emission Schedule /****/
+
+Specter uses a smooth exponential decay with a perpetual tail
+emission, modeled after Monero's approach but with parameters
+suited to a 120-second block time.
+
+Initial block reward: 50 SPEC.
+
+The block reward decreases smoothly each block (no halvings, no
+supply shocks):
+
+  reward(height) = max(floor(50 * 0.999999 ^ height), 0.6)
+
+This produces a smooth decay curve. The reward reaches the floor
+of 0.6 SPEC per block after approximately 18.3 million blocks
+(~70 months). The tail emission then continues indefinitely at
+0.6 SPEC per block.
+
+Key properties:
+
+  - Total pre-tail supply: ~50 million SPEC
+  - Tail emission: 0.6 SPEC/block = ~3,110 SPEC/day = ~1.14M SPEC/year
+  - Year 1 inflation: high (bootstrapping phase)
+  - Year 10 inflation: ~2.3%
+  - Year 20 inflation: ~1.1%
+  - Approaches 0% asymptotically
+
+The tail emission ensures miners always have baseline revenue
+independent of fee markets. The smooth decay avoids the halving
+shocks that create speculative cycles. The 0.6 SPEC/block floor
+may be below the long-term coin loss rate, making Specter
+potentially net-deflationary in practice.
+
+No premine. No founder's reward. No ICO. The first block reward
+goes to the first miner who solves it.
+
+/****/ What I Achieve /****/
+
+No signatures on-chain. Ever.
+
+No public keys on-chain. Ever.
+
+No addresses. Outputs are commitments. Recipients scan for theirs.
+
+No elliptic curves. The entire system is hash-based.
+
+Post-quantum security by construction, not by retrofit.
+
+No trusted setup.
+
+Non-interactive transactions via hash-based stealth addresses.
+
+Fast verification (under 5 ms per transaction proof, parallelizable).
+
+Fast proving (under 1 second per transaction on modern hardware).
+
+View tags for 6x faster wallet scanning.
+
+Proof pruning for sustainable chain growth (~130 MB/day, below Bitcoin).
+
+UTXO accumulator for compact nodes (<1 KB state).
+
+Cut-through compression.
+
+Privacy by default. Witness data never leaves the user's device.
+
+User-side proving. The sender generates the proof. The network
+only verifies.
+
+Fair emission. No premine, smooth decay, perpetual tail reward.
+
+/****/ Questions I Woke Up Sweating About /****/
+
+Q: What if someone loses their REV?
+
+A: They lose their funds. This is the same as losing a Bitcoin
+   private key. Social recovery schemes could help, but they
+   add complexity I leave for future work.
+
+Q: How do you handle light clients?
+
+A: Light clients verify block headers and the PoW chain. They
+   trust the longest chain without downloading full transaction
+   data or verifying individual proofs. This is comparable to
+   SPV in Bitcoin. Compact nodes go further: they verify UTXO
+   inclusion proofs against the MMR root in the block header.
+
+Q: What about scripts and conditions?
+
+A: Not in version one. If there is demand, I could add simple
+   conditions (timelocks, hashlocks) by extending the proof
+   statement. But simplicity is a feature.
+
+Q: Why Plonky3 over BabyBear instead of Winterfell over Goldilocks?
+
+A: Three reasons. First, BabyBear field operations are 2-4x
+   faster than Goldilocks on the same hardware (31-bit vs 64-bit
+   SIMD). Second, Plonky3 has GPU support via ICICLE; Winterfell
+   does not. Third, the ecosystem is consolidating around Plonky3
+   and BabyBear (SP1, RISC Zero, Miden). Winterfell's own
+   flagship project (Miden VM) is migrating away from it.
+
+Q: Is proof generation too slow for users?
+
+A: No. With Plonky3 over BabyBear, a per-transaction STARK proof
+   takes under 1 second on a modern multi-core CPU. On GPU, under
+   500 ms. This is faster than the time it takes to type a
+   recipient address.
+
+Q: Is mining decentralized?
+
+A: Yes. Miners do not generate proofs - users do. The miner's
+   job is to verify proofs (cheap), assemble blocks, and find
+   a valid RandomX nonce. RandomX is specifically designed for
+   CPU mining, resisting ASIC and FPGA advantage. Any commodity
+   hardware can mine.
+
+Q: You dropped Pedersen commitments. What do you lose?
+
+A: Additive homomorphism. I can no longer check balance
+   conservation by adding commitment points. Instead, balance
+   checks happen inside the STARK proof. This adds some proving
+   cost but removes all elliptic curve dependencies. The
+   trade-off is worth it for genuine post-quantum security.
+
+Q: You dropped elliptic-curve stealth addresses. What do you lose?
+
+A: Compact key exchange. The hash-based scheme requires encrypted
+   hints that are somewhat larger, and scanning is O(n) in hints.
+   View tags reduce this to effectively O(n/256) full decryption
+   attempts, which is fast enough for practical use.
+
+Q: Per-transaction proofs are 30-50 KB. Isn't that too large?
+
+A: Larger than a post-quantum signature, yes. But each proof
+   replaces not just a signature - it replaces a signature, a
+   range proof, a balance proof, and a nullifier proof. All in
+   one object. And the proof buys you something signatures never
+   could: complete privacy.
+
+   More importantly, proofs are pruned after 48 hours. The
+   permanent per-transaction footprint is ~360 bytes. Over its
+   lifetime, a Specter full node stores less data than a Bitcoin
+   full node.
+
+Q: What about the chain size? 30-50 KB proofs per transaction
+   sounds like it will balloon out of control.
+
+A: This was the biggest problem in the original design. Without
+   pruning, 500 txs/block at 50 KB proofs = 25 MB/block =
+   18 GB/day. That is unsurvivable.
+
+   With proof pruning (discard proofs after 1440 confirmations),
+   cut-through (eliminate spent intermediate outputs), and UTXO
+   accumulator (compact node state), the permanent chain growth
+   is ~130 MB/day. That is below Bitcoin's ~250 MB/day.
+
+   Proofs exist on the network for ~48 hours, during which they
+   are verified by full nodes and miners. After that, they are
+   discarded. The chain keeps the results, not the proofs.
+
+/****/ Future Directions /****/
+
+Proof aggregation. Recursive STARK composition could compress
+per-transaction proofs into a single block-level proof, reducing
+verification cost. However, this requires the aggregator to process
+all individual proofs, which introduces a trust point. Whether this
+trade-off is acceptable depends on whether the aggregator can be
+kept from learning anything beyond "this proof is valid."
+
+Proof markets. Users who lack hardware for proof generation can
+outsource to competing provers. This introduces a privacy trade-off
+(the prover sees the witness), but trusted execution environments
+could mitigate this.
+
+State channels. Off-chain transactions with on-chain settlement proofs.
+
+STARK-to-SNARK wrapping. For use cases requiring constant-size
+verification (e.g., cross-chain bridges), wrap the STARK proof in
+a SNARK. This preserves transparency during proving while achieving
+compact verification.
+
+Dummy inputs for perfect multi-input unlinkability. Following
+Zcash Orchard's action model, each transaction action could contain
+exactly one spend and one output, with dummy actions
+indistinguishable from real ones. This would eliminate the
+statistical linkage signal from multi-input transactions.
+
+GPU-assisted proving in browser via WebGPU. All major browsers now
+support WebGPU (Chrome, Firefox, Safari, Edge), and zkSecurity has
+demonstrated 2-5x proving speedups in browser. A web wallet could
+generate Specter proofs entirely client-side with no native
+installation required.
+
+/****/ Conclusion /****/
+
+Bitcoin gave us decentralized money. Privacy coins showed us how to
+hide the addresses and amounts. Specter shows us how to hide the
+authorization itself.
+
+A signature says: "I possess the key that matches this public key."
+A Specter proof says: "I am authorized." Nothing more. The chain
+sees only commitments and proofs. Identity is spectral - present
+but invisible.
+
+The chain is lighter than Bitcoin. The proofs are temporary. The
+privacy is permanent.
+
+This is not an incremental improvement. This is a conceptual shift.
+Authorization is not signature verification. Authorization is a
+statement about identity, proven in zero knowledge by the user,
+verified by every node, visible to no one.
+
+The specter is already here. You just cannot see it.
+
+
+/****/ References /****/
+
+[1]  Nakamoto, S. "Bitcoin: A Peer-to-Peer Electronic Cash System" (2008)
+[2]  Jedusor, T.E. "Mimblewimble" (2016)
+[3]  Maxwell, G. "Confidential Transactions"
+[4]  Ben-Sasson, E. et al. "Scalable, transparent, and post-quantum
+     secure computational integrity" (STARKs)
+[5]  Grassi, L. et al. "Poseidon2: A Faster Version of the Poseidon
+     Hash Function" (2023)
+[6]  Aztec Protocol. "Indexed Merkle Trees for Nullifier Sets"
+[7]  tevador et al. "RandomX: ASIC-resistant proof-of-work" (2019)
+[8]  Polygon Miden. "Client-side proving with STARKs" (2024)
+[9]  Habook, U. and Al Kindi. "A note on adding zero-knowledge to
+     STARKs" (ePrint 2024/1037, revised Feb 2025)
+[10] Dryja, T. "Utreexo: A dynamic hash-based accumulator optimized
+     for the Bitcoin UTXO set" (MIT DCI, 2019)
+[11] Plonky3. Polygon Labs. https://github.com/Plonky3/Plonky3
+[12] Ingonyama. "AIR-ICICLE: Plonky3 on ICICLE" (2025)
+[13] ERC-5564. "Stealth Addresses" (Ethereum, 2023)
+[14] Monero Research Lab. "View tags for reducing wallet sync time"
+     (MRL Issue #73, 2022)
+[15] Nethermind. "STARKPack: Aggregating STARKs for shorter proofs
+     and faster verification" (2024) [future work reference]
+
+
+- ---
+
+Ignotus Nemo
+(Latin: "Unknown Nobody")
