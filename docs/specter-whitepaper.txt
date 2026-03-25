@@ -2,14 +2,14 @@ SPECTER
 
 Ignotus Nemo
 
-Version 1.0.2
-23 March, 2026
+Version 1.0.5
+25 March, 2026
 
 /****/ Introduction /****/
 
 I call my proposal Specter because, like a ghost, authorization in this
 system exists but cannot be seen. There are no signatures. No public keys.
-Only proofs of identity-bound authorization that leave no trace.
+Only proofs of ownership-bound authorization that leave no trace.
 
 Bitcoin requires every node to download and verify every signature ever
 made. This is already painful. With post-quantum cryptography, signatures
@@ -20,16 +20,24 @@ dies in plain sight.
 Specter takes a different path. I do not compress signatures. I
 eliminate them entirely.
 
+This document is a research whitepaper and design specification
+draft. It describes Specter's cryptographic architecture, security
+model, and engineering targets. It is not a complete byte-level
+protocol specification. Serialization formats, wire protocol
+details, and finalized constraint layouts are deferred to the
+implementation specification. Performance numbers are engineering
+targets unless explicitly marked as benchmarked.
+
 /****/ The Core Idea /****/
 
 Instead of proving "this signature is valid for this key," I prove:
 
-  "A transaction was authorized by an identity consistent with an
-   on-chain commitment, bound to this specific transaction, with
-   replay protection."
+  "A transaction was authorized by knowledge of a secret consistent
+   with an on-chain ownership commitment, bound to this specific
+   transaction, with replay protection."
 
 This is a semantic shift. Authorization becomes a zero-knowledge
-statement about identity, not a verification of a signature algorithm.
+statement about ownership, not a verification of a signature algorithm.
 
 The insight comes from observing what signatures actually do:
 
@@ -40,7 +48,7 @@ The insight comes from observing what signatures actually do:
 All three can be achieved with hash-based zero-knowledge proofs.
 No elliptic curve discrete log. No lattice problems. Just hashes.
 
-/****/ Identity Without Keys /****/
+/****/ Ownership Without Keys /****/
 
 Each user holds a Root Entropy Value (REV). This is their master secret.
 From it, I derive everything:
@@ -54,22 +62,31 @@ From it, I derive everything:
     +-- auth_root   = BLAKE3-KDF(REV, "specter.auth-root")
 
   Each root serves exactly one protocol role:
-    id_root:    Derives identity commitments (on-chain anchors)
-    spend_root: Derives spending authority for stealth outputs
-    scan_root:  Derives scanning secrets for output detection
+    id_root:    Derives coinbase ownership commitments
+    spend_root: Receiver-side anchor in stealth ownership derivation
+    scan_root:  Derives scanning key pair for output detection
     null_root:  Derives nullifiers for spend prevention
     auth_root:  Derives per-transaction authorization bindings
 
-  Identity Commitment:   ID = H(id_root || salt || "specter.identity")
   Authorization:         Auth = H(auth_root || tx_hash || "specter.auth")
   Nullifier (2-stage):   sk_note = H(null_root || rho || "specter.note-null")
                          N = H(sk_note || note_cm || "specter.nullifier")
 
-The Identity Commitment goes on-chain. It is the only public anchor to
-the user's identity. The REV never leaves the user's control. No single
-derived root can reconstruct any other, preventing cross-protocol leakage.
+The primary ownership primitive is the per-output owner_commitment,
+derived from the stealth protocol for regular transactions. The
+id_root is used only for coinbase outputs (which have no stealth
+sender). No persistent "identity" goes on-chain. The REV never
+leaves the user's control. No single derived root can reconstruct
+any other, preventing cross-protocol leakage.
 
-When spending, the user proves in zero knowledge:
+All keys are deterministically derived from the REV alone. A user
+who loses their device but retains their REV (or mnemonic encoding
+of it) can fully reconstruct all derived roots, regenerate their
+ML-KEM scan key pair, rescan the chain, and recover all unspent
+notes. This is the wallet recovery guarantee.
+
+When spending, the user proves in zero knowledge. The spend
+authorization relation covers:
 
   C1. "I know a spending secret such that the owner commitment matches"
   C2. "I have bound this proof to this specific transaction"
@@ -77,10 +94,84 @@ When spending, the user proves in zero knowledge:
        and the note, and is fresh (not used before)"
   C4. "All domain tags are consistent"
 
-Four constraints. That is all.
+These four constraints form the core spend authorization. Full
+transaction validity additionally requires:
+
+  V1. Input existence (each input note_cm exists in the UTXO
+      accumulator at the claimed state root)
+  V2. Value conservation (sum of input values = sum of output
+      values + fee)
+  V3. Range validity (all values non-negative, bounded to 64 bits,
+      no overflow)
+  V4. State-root consistency (all inputs proven against the same
+      UTXO root; all nullifier non-membership proofs against the
+      same nullifier root)
+  V5. Canonical encoding (note serialization uniqueness, no
+      alternate encodings producing the same semantic object)
 
 The user generates this proof locally. The proof, not the secret,
 is what enters the network. The REV never leaves the user's device.
+
+/****/ Note Model /****/
+
+A note (UTXO) in Specter is a tuple:
+
+  note = (owner_commitment, value_commitment, rho, memo_ciphertext)
+
+Where:
+  owner_commitment  = H(owner_secret || "specter.owner")     (32 bytes)
+  value_commitment  = H(v || r || "specter.value")           (32 bytes)
+  rho               = per-note randomness (256-bit, unique)
+  memo_ciphertext   = Enc(output_key, v || counter)          (~48 bytes)
+
+The note commitment (the canonical identifier in the UTXO set) is:
+
+  note_cm = H(owner_commitment || value_commitment || rho || "specter.note")
+
+This single value enters the MMR accumulator. The nullifier is bound
+to it:
+
+  sk_note = H(null_root || rho || "specter.note-null")
+  nullifier = H(sk_note || note_cm || "specter.nullifier")
+
+The on-chain output for a stealth transaction contains:
+
+  - note_cm           (32 bytes)
+  - owner_commitment  (32 bytes)
+  - value_commitment  (32 bytes)
+  - KEM ciphertext    (1,088 bytes -- ML-KEM-768)
+  - view_tag          (1 byte)
+  - memo_ciphertext   (~48 bytes)
+
+Total per output: ~1,233 bytes.
+
+For coinbase outputs (no stealth sender), the KEM ciphertext and
+view_tag are absent. The coinbase owner_commitment is derived
+from id_root:
+
+  coinbase_owner = H(id_root || height || "specter.coinbase")
+
+Total per coinbase output: ~144 bytes.
+
+Coinbase outputs form a distinct, weaker privacy domain. They
+lack a sender-generated stealth channel by necessity. Ownership
+is derived deterministically from id_root and block height. An
+observer cannot link coinbase outputs to each other without
+knowing id_root. But if REV is ever compromised, all historical
+coinbase outputs for that miner become retroactively identifiable.
+
+Ordinary stealth outputs remain compartmentalized: each has its
+own owner_secret derived from an ephemeral KEM shared secret, so
+REV compromise does not directly reveal which stealth outputs
+belong to the user without also rescanning the chain.
+
+This asymmetry is a conscious design trade-off. Coinbase outputs
+require deterministic recoverability without a sender. The cost
+is structurally weaker privacy for miner rewards. When a miner
+subsequently spends multiple coinbase-derived notes, the spending
+pattern may create a statistical fingerprint. Miners concerned
+about this should consolidate coinbase outputs through stealth
+self-transfers before spending.
 
 /****/ Why STARKs /****/
 
@@ -103,9 +194,11 @@ conservation, range validity, and nullifier correctness. All in one.
 No public key is ever revealed. No identity is ever linked.
 
 The cost is manageable. Each user generates a 30-50 KB proof when
-sending a transaction. Nodes verify each proof individually -- at
-under 5 ms per proof, a block of 500 transactions takes about one
-second of parallel verification on commodity hardware.
+sending a transaction. Nodes verify each proof individually.
+Preliminary estimates suggest verification under 5 ms per proof,
+meaning a block of 500 transactions would take about one second
+of parallel verification on commodity hardware. These numbers are
+engineering targets pending final circuit benchmarks.
 
 /****/ Proving System: Plonky3 over BabyBear /****/
 
@@ -203,10 +296,14 @@ proof, which explicitly treats the subtlety of quotient polynomial
 decomposition - "a source for mistakes, both in literature as well
 as in software implementations."
 
-Private witness data (REV, blinding factors, values) never appears
-directly in the trace. The trace contains only intermediate hash
-states and commitments. The STARK proves relationships between
-these intermediates, not the raw secrets.
+Private witness data (REV, blinding factors, values) is transformed
+through hash evaluations before entering the trace. The trace
+contains witness-derived intermediate states, not the raw secrets.
+The zero-knowledge property described above ensures that these
+intermediate states are computationally hidden from the verifier:
+the masking polynomials randomize all committed evaluations outside
+the trace domain, making the published commitments indistinguishable
+from random under the hash function's preimage resistance.
 
 /****/ User-Side Proving /****/
 
@@ -246,14 +343,65 @@ generation can be delegated to a trusted prover service, though
 this requires sharing witness data with that service. The
 trade-off is the user's to make.
 
-The proof statement for a single transaction covers:
+The proof statement for a single transaction covers the spend
+authorization relation (C1-C4) and the value validity constraints
+(V2-V3):
 
   - Ownership claim is valid (C1)
   - Authorization is bound to this transaction (C2)
   - Nullifiers are correctly derived (C3)
   - Domain tags match (C4)
-  - Sum of input values equals sum of output values plus fee
-  - All values are in valid range (non-negative, 64-bit)
+  - Sum of input values equals sum of output values plus fee (V2)
+  - All values are in valid range (non-negative, 64-bit) (V3)
+
+Input existence (V1) and state-root consistency (V4) are verified
+outside the STARK via MMR inclusion proofs and nullifier
+predecessor proofs checked by the consensus layer.
+
+/****/ Transaction Canonicalization and Authorization Binding /****/
+
+The authorization digest tx_hash must bind the proof to the exact
+transaction semantics. If any field that affects spend semantics is
+excluded, the protocol is vulnerable to malleability, rebind attacks,
+or output mutation.
+
+tx_hash covers the following fields, concatenated in canonical
+fixed-length encoding:
+
+  tx_hash = H(
+    version                    ||
+    input_note_commitments     ||
+    input_nullifiers           ||
+    utxo_accumulator_root      ||
+    nullifier_tree_root        ||
+    output_note_commitments    ||
+    output_owner_commitments   ||
+    output_value_commitments   ||
+    output_kem_ciphertexts     ||
+    output_view_tags           ||
+    output_memo_ciphertexts    ||
+    fee                        ||
+    "specter.txhash.v1"
+  )
+
+Auth = H(auth_root || tx_hash || "specter.auth")
+
+What is covered: all inputs, all outputs, fee, state roots against
+which membership and non-membership are proven, and all stealth
+delivery data. A change to any covered field invalidates the proof.
+
+What is not covered: the STARK proof itself (the proof attests to
+the digest, not vice versa). Block-level fields (height, timestamp,
+PoW nonce) are not part of the transaction digest; they belong to
+the block header.
+
+What is mutable by relays: nothing. All transaction fields are
+covered by tx_hash and thus by the STARK proof. Relays cannot
+modify any field without invalidating the proof.
+
+Future versions may extend the digest with additional fields
+(locktime, expiry, fork id). The version prefix and domain tag
+allow non-ambiguous upgrades.
 
 /****/ Multi-Input Privacy /****/
 
@@ -264,11 +412,12 @@ Zcash's Sapling protocol also exhibits.
 
 I mitigate this through two mechanisms:
 
-First, each UTXO has its own derived spending secret (derived_rev),
-not the master REV. The proof demonstrates knowledge of derived_rev
-for each input independently. An observer sees multiple nullifiers
-in the same transaction but cannot determine whether they come from
-the same master identity or multiple cooperating parties.
+First, each UTXO has its own note-local spending witness
+(owner_secret), not the master REV. The proof demonstrates
+knowledge of owner_secret for each input independently. An
+observer sees multiple nullifiers in the same transaction but
+cannot determine whether they come from the same master identity
+or multiple cooperating parties.
 
 Second, the wallet implements a coin selection policy that minimizes
 multi-input transactions. When possible, a single UTXO of sufficient
@@ -288,9 +437,22 @@ Both are possible future extensions.
 /****/ Block Production /****/
 
 Proven transactions arrive at the mempool. Nodes verify each proof
-before acceptance. Invalid proofs are rejected immediately. This
-proof-of-work-before-inclusion is the primary anti-spam mechanism:
-generating a valid proof is computationally expensive for the sender.
+before acceptance. Invalid proofs are rejected immediately.
+
+Transaction validation follows a cost-escalating ladder:
+
+  1. Structural checks (nanoseconds): canonical encoding, size
+     caps, field bounds. Reject malformed data before parsing.
+  2. Semantic checks (microseconds): duplicate nullifiers, input/
+     output count limits, fee minimum. Reject obviously invalid
+     transactions before touching the proof.
+  3. STARK proof verification (~1-5 ms): the expensive step.
+     Only reached by structurally and semantically valid
+     transactions.
+
+This ordering ensures that cheap garbage cannot force expensive
+proof verification. Peers that repeatedly submit transactions
+failing at stage 1 or 2 are deprioritized.
 
 The block producer collects verified transactions, packages them
 into a block, and searches for a valid PoW nonce. The block
@@ -301,6 +463,58 @@ each).
 The block producer does not need witness data. It does not need to
 re-prove any transaction. It only verifies existing proofs and
 assembles the block. No trust required.
+
+/****/ Consensus Validation Semantics /****/
+
+A block commits to the following state:
+
+  - utxo_root: MMR root of all unspent note commitments
+  - nullifier_root: indexed Merkle tree root of all spent nullifiers
+  - block_header: height, timestamp, prev_hash, utxo_root,
+    nullifier_root, tx_root, pow_nonce, target
+
+Block headers commit to post-state roots: after all transactions
+in the block have been applied.
+
+Transactions within a block are validated against the block's
+pre-state (the parent block's post-state). All transactions in the
+same block share the same input state roots. This means:
+
+  - Two transactions in the same block cannot spend the same output
+    (duplicate nullifier check across the block's transaction set).
+  - A transaction cannot spend an output created in the same block
+    unless intra-block ordering is enforced and state roots are
+    updated incrementally. In the initial design, same-block
+    spend of same-block outputs is not permitted. Outputs become
+    spendable in the next block.
+
+Consensus validation for each transaction consists of:
+
+  1. Verify the per-transaction STARK proof (covers C1-C4 and
+     V2-V3: ownership, authorization, nullifier correctness,
+     domain separation, balance, and range validity).
+  2. Verify UTXO accumulator inclusion proofs for each input
+     (MMR membership against the claimed utxo_root). These proofs
+     are provided alongside the transaction, outside the STARK.
+  3. Verify nullifier non-membership via low-nullifier predecessor
+     proofs against the claimed nullifier_root. These proofs are
+     also outside the STARK.
+  4. Check that the claimed utxo_root and nullifier_root match
+     the parent block's post-state roots.
+  5. Check nullifier uniqueness across the block (no two
+     transactions in the same block may produce the same nullifier).
+
+After all transactions are validated, the node applies them
+deterministically:
+
+  - Append new note_cm values to the UTXO MMR.
+  - Insert new nullifiers into the indexed Merkle tree.
+  - Compute post-state roots.
+  - Verify post-state roots match the block header commitment.
+
+Transaction ordering within a block is canonical (ordered by
+tx_hash). This ensures deterministic state application across
+all nodes.
 
 /****/ Non-Interactive Transactions /****/
 
@@ -331,14 +545,13 @@ The sender creates a one-time output:
   1. (ciphertext, shared_secret) = ML-KEM-768.Encapsulate(scan_pk)
   2. output_key = BLAKE3-KDF(shared_secret, "specter.stealth-output")
   3. view_tag = first_byte(output_key)
-  4. scan_hint = first_2_bytes(BLAKE3(scan_pk || block_height || output_index))
-  5. owner_secret = BLAKE3-KDF(output_key || H(spend_root) || counter,
+  4. owner_secret = BLAKE3-KDF(output_key || H(spend_root) || counter,
                                 "specter.owner-derive")
-  6. owner_commitment = H(owner_secret || "specter.owner")
+  5. owner_commitment = H(owner_secret || "specter.owner")
 
-The owner_commitment serves as the identity commitment for this
-output. The KEM ciphertext (1,088 bytes), view_tag (1 byte), and
-scan_hint (2 bytes) go on-chain alongside the output commitment.
+The owner_commitment serves as the ownership commitment for this
+output. The KEM ciphertext (1,088 bytes) and view_tag (1 byte) go
+on-chain alongside the output commitment.
 
 The sender encrypts the value and counter using ChaCha20-Poly1305
 keyed by output_key as the stealth memo.
@@ -350,53 +563,67 @@ design choice. I accept it for three reasons:
   1. The KEM is used ONLY for stealth delivery. All authorization,
      commitment, nullifier, and proving logic remains hash-based.
 
-  2. If ML-KEM is ever broken, damage is limited to recipient privacy
-     for future transactions. Past transactions remain private. Funds
-     cannot be stolen because spending authority is hash-based.
+  2. If ML-KEM is ever broken, funds cannot be stolen because
+     spending authority is entirely hash-based. However, recipient
+     privacy may be weakened: an attacker who recorded historical
+     KEM ciphertexts could retrospectively decapsulate them,
+     recovering stealth shared secrets and linking outputs to
+     receivers. The severity depends on the nature of the break.
 
   3. ML-KEM-768 is NIST-standardized (FIPS 203). If lattice assumptions
      fail, HQC (code-based, expected FIPS 2027) can be substituted.
 
-/****/ View Tags and Scan Optimization /****/
+/****/ View Tags: Post-Decapsulation Filtering /****/
 
-Without optimization, the receiver must attempt KEM decapsulation
-for every output on-chain. This is expensive. I use a two-layer
-filtering system:
+Without optimization, the receiver must attempt full KEM
+decapsulation and key derivation for every output on-chain.
+ML-KEM-768 decapsulation costs ~0.1ms per output. At 500
+outputs per block and 720 blocks per day, that is 360,000
+decapsulations per day -- approximately 36 seconds of CPU
+time. Tolerable for a desktop wallet, painful for mobile.
 
-  Layer 1: scan_hint (2 bytes, pure hash check)
-    scan_hint = first_2_bytes(BLAKE3(scan_pk || block_height || output_index))
-    Receiver precomputes per block. Filter rate: 99.998%
-    Cost: ~50 nanoseconds per output
+The view tag reduces this. The 1-byte view_tag is derived
+from the KEM shared secret:
 
-  Layer 2: view_tag (1 byte, derived from KEM shared secret)
-    Only checked for outputs that pass Layer 1.
-    Filter rate: 99.6% of remaining candidates
-    Cost: ~0.1ms per candidate (KEM decapsulation)
+  view_tag = first_byte(BLAKE3-KDF(shared_secret, "specter.stealth-output"))
 
-Combined filter: for a block with 500 outputs, the receiver
-performs ~500 hash checks (Layer 1), ~0.01 KEM decapsulations
-(Layer 2), and essentially zero false-positive full decryptions.
+The receiver decapsulates each output's KEM ciphertext to
+obtain a candidate shared_secret, derives the candidate
+view_tag, and checks against the on-chain value:
+
+  - If mismatch (probability 255/256 = 99.6%), skip further
+    derivation. The decapsulation cost is already paid, but
+    the expensive owner_secret derivation, memo decryption,
+    and commitment verification are skipped.
+  - If match (probability 1/256), proceed with full derivation.
+
+This saves approximately 60-70% of scanning CPU time by
+avoiding the full key derivation chain on non-matching outputs.
+
+The security property is critical: view_tag is derived from
+the KEM shared secret, which only the sender (who knows r)
+and the receiver (who knows scan_sk) can compute. An outside
+observer cannot compute view_tag for a given output without
+breaking ML-KEM. This is the fundamental difference from a
+tag derived purely from public data, which would be a
+recipient tagging oracle.
 
 The receiver scans:
 
   For each output:
-    1. Compute candidate scan_hint from scan_pk and block metadata
-    2. Compare against on-chain scan_hint
-    3. If mismatch, skip (99.998% of outputs)
-    4. If match, attempt ML-KEM-768.Decapsulate(ciphertext)
-    5. Derive output_key, check view_tag
-    6. If view_tag mismatch, skip
-    7. Decrypt memo, recover value and counter
-    8. Derive owner_secret and verify against on-chain owner_commitment
-    9. If match: this output belongs to them
+    1. Attempt ML-KEM-768.Decapsulate(ciphertext) -> shared_secret
+    2. Derive candidate view_tag from shared_secret
+    3. Compare against on-chain view_tag
+    4. If mismatch, skip (99.6% of outputs)
+    5. Derive output_key, owner_secret, owner_commitment
+    6. Check if owner_commitment matches on-chain value
+    7. If match: this output belongs to them
+    8. Decrypt memo, recover value and counter
 
-To SPEND the output, the receiver derives:
-
-  derived_rev = owner_secret
-
-This derived_rev acts as the spending secret for this specific
-output. The receiver proves C1 (knowledge of owner_secret such
-that owner_commitment is valid) in zero knowledge.
+To SPEND the output, the receiver uses owner_secret as the
+note-local spending witness. The receiver proves C1 (knowledge
+of owner_secret such that owner_commitment is valid) in zero
+knowledge.
 
 This scheme uses ML-KEM for key exchange and hashes for everything
 else. Post-quantum safe by construction.
@@ -431,6 +658,18 @@ constraints verify that the bit decomposition is correct
 and the value is non-negative. This replaces Bulletproofs
 or similar external range proof systems with a few hundred
 constraints per value.
+
+The architectural cost extends beyond proving overhead. Without
+additive homomorphism, future features that depend on algebraic
+commitment structure become harder: collaborative transactions
+(CoinJoin-style), payment channels with efficient state updates,
+batched multi-party spend construction, and recursive proof
+aggregation over balance claims. These are not impossible with
+hash-based commitments, but they require the balance relation
+to be re-proved inside each STARK rather than checked cheaply
+via commitment algebra. This is a permanent tax on protocol
+composability, accepted in exchange for genuine post-quantum
+security without algebraic assumptions.
 
 The result: no elliptic curves anywhere in the authorization
 system. The entire protocol is hash-based for authorization
@@ -480,8 +719,66 @@ Both Aztec and Nomos have independently arrived at this same
 conclusion. When two teams solving the same problem converge on
 the same answer, pay attention.
 
+The nullifier construction is designed to satisfy:
+
+  - Uniqueness: each spendable note produces exactly one valid
+    nullifier. No two distinct valid witnesses yield different
+    nullifiers for the same note (enforced by deterministic
+    derivation from null_root, rho, and note_cm).
+  - Unlinkability: an observer cannot determine which note_cm
+    corresponds to a given nullifier without knowing null_root.
+  - Note-binding: the nullifier commits to note_cm, preventing
+    an attacker from producing a valid nullifier that corresponds
+    to a different note.
+  - Collision resistance: under collision resistance of H, no
+    adversary can produce two distinct notes that yield the same
+    nullifier (which would allow one spend to silently invalidate
+    another note).
+
 This prevents double-spending without revealing which output was
 spent. Only the owner knows the mapping from commitment to nullifier.
+
+/****/ Security and Privacy Goals /****/
+
+Specter aims to provide the following properties against a passive
+chain observer (an adversary who sees all on-chain data but does
+not control the user's device or network layer):
+
+  1. Sender anonymity: an observer cannot determine which prior
+     output is consumed by a given nullifier.
+  2. Receiver unlinkability: an observer cannot link an output to
+     its intended recipient without the recipient's scan key.
+  3. Amount hiding: committed values are computationally hidden.
+  4. Authorization unlinkability: proofs from the same user across
+     different transactions are not linkable.
+  5. Post-quantum spend soundness: under collision resistance of
+     the hash function and soundness of the STARK, no adversary
+     (including a quantum one) can forge a valid spend proof.
+  6. Post-quantum stealth confidentiality: under ML-KEM security,
+     stealth delivery is confidential against quantum adversaries.
+
+Specter does NOT aim to provide:
+
+  1. Network-layer anonymity (IP-level sender detection requires
+     Tor, Dandelion++, or similar transport-layer protection).
+  2. Mempool origin hiding.
+  3. Timing or transaction-graph obfuscation.
+  4. Multi-input unlinkability (multiple inputs in a single
+     transaction are linkable as same-spender; see Multi-Input
+     Privacy section).
+  5. Coinbase privacy equivalent to stealth privacy (coinbase
+     outputs form a weaker privacy domain; see Note Model).
+  6. Recovery privacy after REV compromise (a compromised REV
+     allows retroactive identification of all coinbase outputs
+     and, with chain rescanning, stealth outputs).
+  7. Protection against a malicious proving service (delegated
+     proving requires sharing witness data).
+  8. Resistance to endpoint compromise (malware on the user's
+     device can extract the REV).
+
+This enumeration is intended to be exhaustive for the current
+design. Claims of privacy in this paper should be interpreted
+within this adversary model.
 
 /****/ Chain Growth: The Critical Problem /****/
 
@@ -514,24 +811,60 @@ verified result -- the state transition itself (nullifiers added,
 outputs committed) -- is permanent. The proof that justified it is
 ephemeral.
 
-What remains per transaction after pruning:
+What remains per transaction after proof pruning depends on
+whether stealth data (KEM ciphertexts) is also pruned.
 
-  - Input references (nullifiers + commitment refs): ~128 bytes
-  - Output commitments (identity + value + hint + view tag): ~200 bytes
-  - Transaction kernel (fee): ~32 bytes
-  - Total per transaction: ~360 bytes
+Stealth data (KEM ciphertexts, memos) is needed for wallet
+recovery from seed. A receiver who has already scanned does
+not need it again. There are two pruning tiers:
 
-Compare this to the pre-pruning state:
+  Tier 1 -- Proof pruning (after 1440 confirmations):
+    Discard STARK proofs. Stealth data retained.
 
-  - Transaction body: ~360 bytes
-  - STARK proof: ~30-50 KB
-  - Total per transaction: ~30-50 KB
+    Per transaction (2-in/2-out):
+      - Input nullifiers:                     64 bytes
+      - Input note_cm references:             64 bytes
+      - Output note_cm + owner + value cm:   192 bytes
+      - Output KEM ciphertexts:            2,176 bytes
+      - Output view_tags + memos:             98 bytes
+      - Transaction kernel (fee):             48 bytes
+      - Total per transaction:            ~2,642 bytes
 
-Pruning reduces per-transaction storage by 98-99%.
+  Tier 2 -- Stealth data pruning (after extended period):
+    Discard KEM ciphertexts and memos. Only commitments and
+    nullifiers remain. Wallet recovery from this point forward
+    requires archive nodes.
 
-After pruning, 500 transactions per block occupy ~180 KB of
-permanent data. At 720 blocks per day, that is ~130 MB/day.
-This is below Bitcoin's ~250 MB/day.
+    Per transaction (2-in/2-out):
+      - Input nullifiers + references:       128 bytes
+      - Output commitments:                  192 bytes
+      - Transaction kernel:                   48 bytes
+      - Total per transaction:              ~368 bytes
+
+Compare to pre-pruning: ~368 bytes + ~2,274 bytes stealth data
++ 30-50 KB proof = ~33-53 KB.
+
+Tier 1 pruning reduces storage by 92-94%.
+Tier 2 pruning reduces storage by 99%.
+
+At Tier 1 (proofs pruned, stealth data retained):
+  500 txs/block = ~1.3 MB permanent data per block.
+  720 blocks/day = ~940 MB/day.
+
+At Tier 2 (full pruning):
+  500 txs/block = ~184 KB permanent data per block.
+  720 blocks/day = ~133 MB/day.
+
+The honest accounting: with KEM-based stealth, the permanent
+chain is larger than previously stated. Tier 1 growth (~940
+MB/day) is approximately 4x Bitcoin's rate. Tier 2 growth
+(~133 MB/day) is below Bitcoin, but requires archive nodes
+for late wallet recovery.
+
+The practical middle ground: retain stealth data for a recovery
+window (e.g., 90 days), then prune. Users who restore wallets
+after the window need an archive node. This is comparable to
+Bitcoin's assumeUTXO trust model.
 
 New nodes syncing from genesis have two options:
 
@@ -547,6 +880,20 @@ New nodes syncing from genesis have two options:
 Archive nodes retain all proofs permanently for historical
 auditability. They are not required for consensus participation.
 
+An important consequence of proof pruning: historical validity
+becomes an archival availability assumption, not a universally
+verifiable property. A new node syncing after the pruning window
+cannot independently verify pruned transactions without obtaining
+proofs from archive nodes. Ongoing consensus remains trustless
+(all recent proofs are available and verified). Historical full
+verification requires that at least one archive node preserves
+the proof data. This is the same trust model as Bitcoin's
+assumeUTXO, applied to proof data rather than UTXO snapshots.
+
+In short: Specter preserves trustless ongoing consensus, but
+trustless historical re-verification is optional and archive-
+dependent after the pruning horizon.
+
 /****/ Cut-Through /****/
 
 If an output is created and spent within the same block,
@@ -558,11 +905,14 @@ both can be eliminated:
 The intermediate output B never needs to exist on-chain. This
 reduces block size and state bloat.
 
-Cut-through also applies across blocks during pruning. Once both
-the creating transaction and the spending transaction have been
-pruned (proofs discarded), the intermediate output can be removed
-from the permanent record entirely. Only the nullifier (proving
-it was spent) and the final unspent outputs remain.
+Cross-block cut-through during pruning is more constrained than
+in Mimblewimble. An intermediate output that has been created and
+spent may have its commitments removed from the UTXO set, but its
+stealth data (KEM ciphertext, memo) may still be needed by a
+receiver who has not yet scanned that region of the chain. Intra-
+block cut-through is clean. Cross-block cut-through of commitment
+data is safe only after the stealth data retention window has
+passed.
 
 Over time, the permanent chain state converges toward:
 
@@ -571,10 +921,10 @@ Over time, the permanent chain state converges toward:
   - Unspent output commitments
   - The nullifier set
 
-This is structurally similar to Mimblewimble's long-term state,
-where cut-through achieves ~98% data reduction over time. Specter
-achieves comparable compression through proof pruning plus
-cut-through.
+This is structurally similar to Mimblewimble's long-term state.
+The difference: Specter's stealth metadata introduces a retention
+dependency that Mimblewimble does not have. Cross-block cut-through
+is achievable but bounded by the stealth data retention window.
 
 /****/ UTXO Set Accumulator /****/
 
@@ -589,9 +939,12 @@ than 1 KB of data -- and verify inclusion proofs provided by peers
 or by the spender.
 
 When spending a UTXO, the wallet includes a short MMR inclusion
-proof (~500 bytes) alongside the transaction. This proof
-demonstrates that the referenced output exists in the UTXO set
-without requiring the verifier to store the full set.
+proof (~500 bytes) alongside the transaction, outside the STARK
+proof. The verifier checks membership separately from the STARK.
+This avoids the proving cost explosion of embedding full Merkle
+path verification inside the arithmetic circuit. The STARK covers
+ownership, authorization, nullifier, balance, and range constraints.
+The MMR inclusion proof covers input existence.
 
 This creates a spectrum of node types:
 
@@ -602,16 +955,20 @@ This creates a spectrum of node types:
 
 /****/ Chain Growth Summary /****/
 
-                      Before pruning    After pruning    Bitcoin
-Per-block data        ~25 MB            ~180 KB          ~1.7 MB
-Per-day growth        ~18 GB            ~130 MB          ~250 MB
-Per-year growth       ~6.6 TB           ~47 GB           ~91 GB
-5-year chain size     ~33 TB            ~237 GB          ~450 GB
+                      Before pruning   Tier 1 pruned    Tier 2 pruned   Bitcoin
+Per-block data        ~27 MB           ~1.3 MB          ~184 KB         ~1.7 MB
+Per-day growth        ~19 GB           ~940 MB          ~133 MB         ~250 MB
+Per-year growth       ~7 TB            ~343 GB          ~49 GB          ~91 GB
+5-year chain size     ~35 TB           ~1.7 TB          ~243 GB         ~450 GB
 
-Specter's pruned chain growth (~130 MB/day) is approximately half
-of Bitcoin's growth rate. Archive nodes storing full proofs will
-require substantially more storage, but they are a specialized
-role, not a requirement for network participation.
+At Tier 1 (stealth data retained), Specter's chain growth is
+approximately 4x Bitcoin's rate. This is the cost of KEM-based
+stealth privacy. At Tier 2 (full pruning with archive-dependent
+recovery), growth falls below Bitcoin.
+
+The practical recommendation: run Tier 1 with a 90-day stealth
+data retention window. Archive nodes retain everything permanently
+for late wallet recovery and historical auditability.
 
 /****/ Concrete Hash Function: Poseidon2 over BabyBear /****/
 
@@ -684,9 +1041,12 @@ knows that each transaction's proof verified successfully.
 
 Proof generation cost is borne by the sender. Generating a valid
 STARK proof costs 2-5 seconds of CPU time with Plonky3 over
-BabyBear. This is the natural anti-spam mechanism: the
-computational cost of proof generation prevents transaction
-flooding more effectively than fee-based rate limiting alone.
+BabyBear. This raises the marginal cost of transaction creation,
+providing a natural rate limit on honest wallet issuance. However,
+proof generation cost alone is not a complete anti-spam mechanism:
+adversaries with dedicated GPU clusters or proof-farming
+infrastructure can amortize this cost. Fee-market-based spam
+resistance remains necessary as a complementary mechanism.
 
 Block time: 120 seconds. This provides room for proof verification,
 block propagation across the network, and reduces chain growth.
@@ -718,23 +1078,24 @@ supply shocks):
   reward(height) = max(floor(50 * 0.999999 ^ height), 0.6)
 
 This produces a smooth decay curve. The reward reaches the floor
-of 0.6 SPEC per block after approximately 18.3 million blocks
-(~70 months). The tail emission then continues indefinitely at
-0.6 SPEC per block.
+of 0.6 SPEC per block after approximately 4.4 million blocks
+(~16.8 years at 720 blocks/day). The tail emission then continues
+indefinitely at 0.6 SPEC per block.
 
 Key properties:
 
-  - Total pre-tail supply: ~50 million SPEC
-  - Tail emission: 0.6 SPEC/block = ~3,110 SPEC/day = ~1.14M SPEC/year
+  - Total pre-tail supply: ~49.4 million SPEC
+  - Tail emission: 0.6 SPEC/block = 432 SPEC/day = ~158K SPEC/year
   - Year 1 inflation: high (bootstrapping phase)
-  - Year 10 inflation: ~2.3%
-  - Year 20 inflation: ~1.1%
+  - Year 10 inflation: ~1.8% (still in decay phase)
+  - Year 20 inflation: ~0.3% (tail phase)
   - Approaches 0% asymptotically
 
 The tail emission ensures miners always have baseline revenue
 independent of fee markets. The smooth decay avoids the halving
-shocks that create speculative cycles. The 0.6 SPEC/block floor
-may be below the long-term coin loss rate, making Specter
+shocks that create speculative cycles. At ~158K SPEC/year against
+a mature supply of ~50M, the tail inflation rate of ~0.3% may
+fall below the long-term coin loss rate, making Specter
 potentially net-deflationary in practice.
 
 No premine. No founder's reward. No ICO. The first block reward
@@ -744,7 +1105,9 @@ goes to the first miner who solves it.
 
 No signatures on-chain. Ever.
 
-No public keys on-chain. Ever.
+No authorization public keys revealed in spend validation. KEM
+ciphertexts appear on-chain for stealth delivery, but no key
+used for spending verification is ever exposed.
 
 No addresses. Outputs are commitments. Recipients scan for theirs.
 
@@ -756,15 +1119,23 @@ Post-quantum security by construction, not by retrofit.
 No trusted setup.
 
 Non-interactive transactions via PQ-KEM stealth addresses with
-two-layer scan optimization.
+view tag scan optimization.
 
-Fast verification (under 5 ms per transaction proof, parallelizable).
+Verification target: under 5 ms per transaction proof,
+parallelizable. (Preliminary estimate from AIR sketch; not yet
+benchmarked on the final circuit.)
 
-Honest proving targets (2-5 seconds per transaction on modern hardware).
+Proving target: 2-5 seconds per transaction on modern multi-core
+CPU. (Engineering target, pending final AIR and prover
+implementation.)
 
-View tags and scan hints for efficient wallet scanning.
+View tags for post-decapsulation filtering (derived from KEM shared
+secret, not from public data). The KEM decapsulation cost is always
+paid; view tags reduce the downstream derivation and verification
+work on non-matching outputs.
 
-Proof pruning for sustainable chain growth (~130 MB/day, below Bitcoin).
+Proof pruning for managed chain growth. Tiered pruning from ~940
+MB/day (stealth data retained) to ~133 MB/day (full pruning).
 
 UTXO accumulator for compact nodes (<1 KB state).
 
@@ -839,9 +1210,10 @@ Q: You dropped elliptic-curve stealth addresses. What do you lose?
 
 A: Compact key exchange. I replaced ECDH with ML-KEM-768 (NIST
    FIPS 203) for post-quantum safety. The KEM ciphertexts are
-   larger (~1 KB) but the two-layer scan filtering (scan_hint +
-   view_tag) keeps wallet sync fast. The KEM is used only for
-   stealth delivery, not for authorization.
+   larger (~1 KB per output) and scanning requires per-output
+   KEM decapsulation (~0.1ms each). View tags reduce post-decap
+   work by ~99.6%. The cost is real but manageable. The KEM is
+   used only for stealth delivery, not for authorization.
 
 Q: Per-transaction proofs are 30-50 KB. Isn't that too large?
 
@@ -852,9 +1224,9 @@ A: Larger than a post-quantum signature, yes. But each proof
    could: complete privacy.
 
    More importantly, proofs are pruned after 48 hours. The
-   permanent per-transaction footprint is ~360 bytes. Over its
-   lifetime, a Specter full node stores less data than a Bitcoin
-   full node.
+   permanent per-transaction footprint depends on the pruning
+   tier: ~2.6 KB with stealth data retained, ~368 bytes after
+   full pruning. Both are far smaller than the original proof.
 
 Q: What about the chain size? 30-50 KB proofs per transaction
    sounds like it will balloon out of control.
@@ -864,9 +1236,11 @@ A: This was the biggest problem in the original design. Without
    18 GB/day. That is unsurvivable.
 
    With proof pruning (discard proofs after 1440 confirmations),
-   cut-through (eliminate spent intermediate outputs), and UTXO
-   accumulator (compact node state), the permanent chain growth
-   is ~130 MB/day. That is below Bitcoin's ~250 MB/day.
+   cut-through, and UTXO accumulator, chain growth drops to
+   ~940 MB/day with stealth data retained, or ~133 MB/day
+   after full pruning. The KEM ciphertexts are the dominant
+   permanent cost -- this is the honest price of PQ stealth
+   privacy.
 
    Proofs exist on the network for ~48 hours, during which they
    are verified by full nodes and miners. After that, they are
@@ -925,8 +1299,10 @@ A Specter proof says: "I am authorized." Nothing more. The chain
 sees only commitments and proofs. Identity is spectral - present
 but invisible.
 
-The chain is lighter than Bitcoin. The proofs are temporary. The
-privacy is permanent.
+The proofs are temporary. The privacy is permanent. With aggressive
+pruning and archive-dependent recovery, steady-state chain growth
+can fall below Bitcoin. Without it, privacy has a storage cost.
+This is an honest trade-off, not a free lunch.
 
 This is not an incremental improvement. This is a conceptual shift.
 Authorization is not signature verification. Authorization is a
