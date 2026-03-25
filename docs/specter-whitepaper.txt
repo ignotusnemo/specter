@@ -2,7 +2,7 @@ SPECTER
 
 Ignotus Nemo
 
-Version 1.0
+Version 1.0.1
 23 March, 2026
 
 /****/ Introduction /****/
@@ -601,21 +601,38 @@ native speed (~3-8 GB/s single-threaded).
 
 /****/ Consensus /****/
 
-Proof-of-work using RandomX. CPU-friendly. ASIC-resistant.
-Decentralized mining accessible to commodity hardware.
+Proof-of-work using double Blake3. Simple. Fast to verify.
+Consistent with the rest of the protocol: hash-based, auditable,
+no exotic dependencies.
 
-RandomX uses randomized code execution with memory-hard techniques
-to minimize the efficiency advantage of specialized hardware. It
-requires 2 GB of memory and relies on CPU features (branch prediction,
-cache hierarchy, speculative execution) that are expensive to
-replicate in ASICs or FPGAs.
+Blake3 is already in Specter's dependency tree for Merkle
+commitments and general-purpose hashing. Using it for PoW adds
+zero new dependencies. Verification takes nanoseconds, not
+milliseconds -- header sync becomes I/O-bound, not CPU-bound.
+The implementation is roughly 50 lines, not 10,000. It is
+trivially auditable.
+
+The trade-off: Blake3 PoW favors GPUs and eventually ASICs.
+But consider what actually rate-limits transaction spam in
+Specter. It is not PoW. It is per-transaction STARK proof
+generation (~1 second of CPU time per transaction). The PoW's
+job is block-level Sybil resistance and emission scheduling,
+not transaction spam prevention. For that purpose, a simple
+hash-based PoW is sufficient. Bitcoin secures a trillion-dollar
+network with double-SHA256 -- about as simple as it gets.
+
+The PoW function:
+
+  pow_hash = Blake3(Blake3(header_bytes || nonce))
+
+Valid if pow_hash < target. That is all.
 
 The block producer:
 
   1. Collects proven transactions from the mempool
   2. Verifies each per-transaction STARK proof
   3. Assembles block with proven transactions
-  4. Finds valid RandomX nonce
+  4. Finds valid Blake3 nonce
   5. Broadcasts block
 
 The miner does not generate individual transaction proofs. It does
@@ -747,12 +764,14 @@ A: No. With Plonky3 over BabyBear, a per-transaction STARK proof
 
 Q: Is mining decentralized?
 
-A: Yes. Miners do not generate proofs - users do. The miner's
-   job is to verify proofs (cheap), assemble blocks, and find
-   a valid RandomX nonce. RandomX is specifically designed for
-   CPU mining, resisting ASIC and FPGA advantage. Any commodity
-   hardware can mine.
-
+A: Miners do not generate proofs -- users do. The miner's job
+   is to verify proofs (cheap), assemble blocks, and find a valid
+   Blake3 nonce. Mining with Blake3 will favor GPUs and eventually
+   ASICs. This is an accepted trade-off: the protocol's anti-spam
+   mechanism is per-transaction STARK proof generation, not PoW
+   complexity. Mining centralization is an economic problem, not
+   an algorithm problem.
+   
 Q: You dropped Pedersen commitments. What do you lose?
 
 A: Additive homomorphism. I can no longer check balance
@@ -862,7 +881,7 @@ The specter is already here. You just cannot see it.
 [5]  Grassi, L. et al. "Poseidon2: A Faster Version of the Poseidon
      Hash Function" (2023)
 [6]  Aztec Protocol. "Indexed Merkle Trees for Nullifier Sets"
-[7]  tevador et al. "RandomX: ASIC-resistant proof-of-work" (2019)
+[7]  O'Connor, J. et al. "BLAKE3: one function, fast everywhere" (2020)
 [8]  Polygon Miden. "Client-side proving with STARKs" (2024)
 [9]  Habook, U. and Al Kindi. "A note on adding zero-knowledge to
      STARKs" (ePrint 2024/1037, revised Feb 2025)
