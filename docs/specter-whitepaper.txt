@@ -49,7 +49,7 @@ make this design workable:
   4. Epoch compression proofs for trustless historical verification
   5. Two-role block production: block producers and miners
   6. Two-phase spend path for wallet UX
-  7. Witness bundle protocol with block-producer serving obligations
+  7. Witness bundle protocol with mandatory fetch cascade and relay
   8. Proof-aware fee market with consensus-enforced fee distribution
 
 Specter is post-quantum-targeting. Its permanent authorization surface
@@ -216,6 +216,19 @@ Consensus parameters (canonical values):
   BLOCK_PRODUCER_FEE_SHARE     =  30   (percent of total fragment fees)
   BLOCK_PRODUCER_COINBASE_SHARE =  10   (percent of scheduled block reward)
   EPOCH_PROVER_BOUNTY_SHARE = 5   (percent of total epoch fees)
+  WITNESS_FETCH_TIMEOUT    =  5 seconds
+  WITNESS_MIN_PEER_SOURCES =  3
+  WITNESS_RELAY_TTL        =  3 hops
+  WITNESS_RELAY_DEDUP_WINDOW = 30 seconds
+  WITNESS_CASCADE_TIMEOUT  =  30 seconds
+  WITNESS_SAMPLE_SIZE      =  4
+  WITNESS_SAMPLE_TIMEOUT   =  10 seconds
+  WITNESS_FAIL_PENALTY     =  10 points
+  WITNESS_SUCCESS_REWARD   =  1 point
+  WITNESS_DISCONNECT_THRESHOLD = -50 points
+  WITNESS_BAN_DURATION     =  144 blocks
+  WITNESS_RELIABILITY_WINDOW = 100 blocks
+  WITNESS_RELIABILITY_THRESHOLD = 95 percent
   SPEC_BASE_UNITS          =  100,000,000
   INITIAL_REWARD           =  5,000,000,000 base units
   TAIL_REWARD              =  60,000,000 base units
@@ -541,8 +554,8 @@ The canonical witness for spending output n is:
     auth_root,
     n,
     rho,
-    inclusion_witness,       -- MMR path proving output_cm is in UTXO set
-    nonmembership_witness    -- IMT path proving nullifier is not yet spent
+    inclusion_witness,       -- MMR path (from WitnessBundle, served by network)
+    nonmembership_witness    -- IMT path (computed locally by wallet from IMT state)
   )
 
 The proving relation derives inside the circuit:
@@ -764,11 +777,11 @@ on every chain tip movement.
 
 /**** Two-Phase Spend Path ****/
 
-The standard spend proof takes 1–5 seconds to generate on CPU. If
-wallets must complete a full proof before any network-visible action,
-the UX is equivalent to:
+The standard spend proof takes 0.3–2 seconds to generate (0.3-0.8
+seconds on GPU, 1-2 seconds on CPU). If wallets must complete a full
+proof before any network-visible action, the UX is equivalent to:
 
-  "nothing happens for 4 seconds, then the send appears"
+  "nothing happens for 1-2 seconds, then the send appears"
 
 This is unacceptable for practical use. Specter defines a two-phase
 spend protocol.
@@ -872,12 +885,12 @@ UX consequence
 From the user's perspective:
 
   click "send" → "pending" state appears immediately
-  1-5 seconds later → "in mempool" state appears
+  0.3-2 seconds later → "in mempool" state appears
   next block → "confirmed"
 
 This is substantially better than:
 
-  "spinner" for 4 seconds → "in mempool" appears
+  "spinner" for 1-2 seconds → "in mempool" appears
 
 
 /**** Witness Bundle Protocol ****/
@@ -903,12 +916,33 @@ Witness bundle
     anchor_height         8 bytes
     anchor_root          32 bytes
     inclusion_witness    ~27 x 32 bytes   MMR path
-    nonmembership_witness ~32 x 32 bytes  IMT path
     bundle_expiry         8 bytes   (anchor_height + ANCHOR_WINDOW)
 
+WitnessBundles contain MMR inclusion witnesses only. The IMT non-
+membership witness is NOT included because it depends on the
+spender's nullifier value, which derives from secret wallet material
+(null_root). Including it would require the wallet to reveal which
+nullifier it intends to publish.
+
+The wallet generates the IMT non-membership witness separately:
+
+  1. The wallet downloads IMT state from any full node (the IMT is
+     public consensus state). Full nodes MUST serve IMT state
+     snapshots at any anchor_height within the anchor window via a
+     GetIMTState(anchor_height) request.
+  2. The wallet locally computes the non-membership proof for its
+     derived nullifier against the IMT state at anchor_root.
+  3. The wallet combines the WitnessBundle's inclusion_witness with
+     the locally computed non-membership_witness to form the complete
+     witness for proof generation.
+
+This separation preserves spend privacy: neither the block producer
+nor any full node learns which nullifier the wallet will publish
+until the SpendIntent is broadcast.
+
 Witness bundles are self-verifying: a recipient can verify the
-inclusion and non-membership proofs independently against the claimed
-anchor_root, without trusting the provider.
+inclusion proof independently against the claimed anchor_root's MMR,
+without trusting the provider.
 
 Witness serving is not ancillary infrastructure; it is part of spend
 availability. A wallet that cannot obtain a valid WitnessBundle cannot
@@ -960,27 +994,310 @@ Send-time flow:
   -> proof generation can begin immediately without network round-trip
   -> anchor rebasing updates the attachment header if needed
 
+Witness fetch cascade (mandatory)
+
+Wallets MUST follow a structured fallback cascade when fetching
+witnesses. Each tier is attempted in order; the wallet advances to
+the next tier only after the current tier is exhausted.
+
+  Tier 1: Block producer (primary source)
+    Request GetWitnessBundle(output_id, anchor_height) from the
+    block producer identified by producer_address in the block header
+    where the output was created. Timeout: WITNESS_FETCH_TIMEOUT.
+
+  Tier 2: Direct full node peers
+    Request from WITNESS_MIN_PEER_SOURCES distinct full node peers
+    selected from the wallet's peer set. Requests are issued in
+    parallel. The wallet accepts the first valid response but MUST
+    continue collecting responses until WITNESS_MIN_PEER_SOURCES
+    replies arrive or all peers timeout, for divergence detection.
+
+  Tier 3: Witness relay layer
+    If Tiers 1 and 2 both fail, the wallet issues a
+    RelayWitnessRequest(output_id, anchor_height) to any connected
+    peer. The receiving peer MUST propagate the request via gossip
+    (bounded by WITNESS_RELAY_TTL hops). Any node that can construct
+    the requested WitnessBundle responds via the reverse relay path.
+    Relay responses carry the responder's node_id for peer scoring
+    purposes but the wallet verifies the bundle cryptographically
+    regardless of source identity.
+
+    RelayWitnessRequest:
+      output_id        32 bytes
+      anchor_height     8 bytes
+      requester_id     32 bytes   (ephemeral session ID, not wallet identity)
+      relay_ttl         1 byte    (decremented at each hop, dropped at 0)
+
+    WITNESS_RELAY_TTL = 3    (maximum gossip hops)
+
+    Relay protocol rules:
+      - Nodes MUST NOT relay requests with relay_ttl = 0.
+      - Nodes MUST decrement relay_ttl before forwarding.
+      - Nodes MUST deduplicate relay requests by
+        H(output_id || anchor_height || requester_id) within a
+        WITNESS_RELAY_DEDUP_WINDOW = 30 seconds window.
+      - Nodes that hold the requested witness data MUST respond
+        directly via the reverse path rather than forwarding.
+      - Relay responses are standard WitnessBundles and are verified
+        identically to Tier 1/2 responses.
+
+  Tier 4: Fallback full node connection
+    If all previous tiers fail, the wallet SHOULD attempt to connect
+    to additional full nodes outside its current peer set (using DNS
+    seeds, hardcoded bootstrap nodes, or user-configured endpoints).
+    This is the last-resort path for wallets whose existing peers
+    are all non-responsive or eclipsed.
+
+Cascade parameters:
+
+  WITNESS_FETCH_TIMEOUT     = 5 seconds    (per-source timeout)
+  WITNESS_MIN_PEER_SOURCES  = 3            (Tier 2 parallel requests)
+  WITNESS_RELAY_TTL         = 3            (max gossip hops)
+  WITNESS_RELAY_DEDUP_WINDOW = 30 seconds  (relay request dedup)
+  WITNESS_CASCADE_TIMEOUT   = 30 seconds   (total cascade budget)
+
+The cascade is subject to WITNESS_CASCADE_TIMEOUT. If no valid
+witness is obtained within this budget across all tiers, the wallet
+declares a witness availability fault.
+
 Multi-source verification:
 
-  Wallets SHOULD request each WitnessBundle from at least two
-  independent sources (e.g., the block producer and a full node peer)
-  and verify both against the anchor_root. Divergent bundles indicate
-  either a provider fault or a witness relay eclipse attempt. The
-  wallet MUST use the bundle that verifies correctly and SHOULD log
-  the discrepancy.
+  Regardless of which tier succeeds, wallets MUST request each
+  WitnessBundle from at least two independent sources across any
+  tiers. The wallet verifies both against the anchor_root. Divergent
+  bundles indicate either a provider fault or a witness relay eclipse
+  attempt. The wallet MUST use the bundle that verifies correctly
+  and MUST log the discrepancy for peer scoring.
+
+  This is a MUST, not a SHOULD. A wallet that accepts a witness from
+  a single source without cross-verification is vulnerable to a
+  targeted eclipse attack where one malicious node provides a
+  fabricated witness path. Cross-verification is the wallet's
+  primary defense against per-wallet targeted withholding.
 
 Witness availability fault
 
-If a wallet cannot obtain a WitnessBundle from any source after
-exhausting its peer list:
+If a wallet cannot obtain a verified WitnessBundle from any source
+after exhausting the cascade:
 
   - The wallet MUST NOT attempt to generate a proof without a
     verified WitnessBundle. Proofs generated without valid witnesses
     will fail verification.
-  - The wallet SHOULD notify the user that spend availability is
+  - The wallet MUST notify the user that spend availability is
     degraded and suggest trying again after the network recovers.
-  - The wallet SHOULD try at minimum 3 distinct sources (block
-    producer + 2 full node peers) before declaring unavailability.
+  - The wallet MUST log which tiers failed and which peers were
+    non-responsive, contributing to local peer scoring.
+  - The wallet SHOULD broadcast a WitnessFailureReport to its
+    connected peers (see Witness Availability Enforcement) so that
+    the network-wide peer scoring system can incorporate the failure.
+
+
+/**** Witness Availability Enforcement ****/
+
+Witness serving in earlier drafts relied entirely on social expectation
+and peer scoring. This section specifies three reinforcing mechanisms
+that make witness availability a consensus-verifiable and economically
+enforceable property.
+
+Mechanism 1: Witness inclusion commitment (consensus-enforced)
+
+Every block header contains witness_bundle_root: the Merkle root of
+inclusion witness commitments for all new outputs created in that block.
+
+Why inclusion-only: A full WitnessBundle contains both an MMR inclusion
+proof and an IMT non-membership proof. The inclusion proof depends only
+on the output_id and the post-state MMR -- both known to validators. The
+non-membership proof depends on the output owner's future nullifier
+value, which derives from wallet_seed and is secret. Validators cannot
+reconstruct non-membership witnesses, so the commitment covers only the
+inclusion witness portion. The non-membership witness is generated
+on-demand by the spending wallet at spend time (it depends on the anchor
+state chosen for that spend, not on the block of output creation).
+
+  witness_bundle_root = MerkleRoot(
+    witness_leaf(output_0),
+    witness_leaf(output_1),
+    ...
+    witness_leaf(output_N)
+  )
+
+Where each leaf is:
+
+  witness_leaf = H(
+    "specter.witness-leaf" ||
+    output_id              ||
+    block_height           ||
+    utxo_root_post         ||
+    inclusion_path_hash
+  )
+
+  inclusion_path_hash = H("specter.inc-path" ||
+                           mmr_inclusion_path_bytes)
+
+  block_height and utxo_root_post are the producing block's own
+  height and post-state MMR root. These anchor the inclusion proof
+  to a specific, verifiable state.
+
+Consensus validation (block validation step 11):
+
+  After applying the state_diff (step 6), the validating node has
+  the post-state MMR. For each output in new_outputs[], the node
+  computes the MMR inclusion path, hashes the witness_leaf, and
+  reconstructs the Merkle root. If the reconstructed root does not
+  match the header's declared witness_bundle_root, the block is
+  invalid.
+
+  This is fully deterministic: every validating node derives the
+  same inclusion paths from the same post-state MMR, producing the
+  same witness_bundle_root. No secret material is required.
+
+This is a hard consensus rule. A block producer who fails to compute
+correct inclusion witnesses cannot produce a valid block. This
+transforms witness computation from a social obligation into a block
+validity requirement.
+
+What this proves: the block producer computed valid MMR inclusion
+paths for every new output at the time of block production, and the
+post-state MMR is consistent with those paths. What this does NOT
+prove: (a) the block producer will serve those witnesses after block
+publication (addressed by Mechanism 2), or (b) the non-membership
+witness portion of a full WitnessBundle (which the spending wallet
+generates at spend time against its chosen anchor state).
+
+Mechanism 2: Witness availability sampling (protocol-enforced)
+
+Nodes perform randomized witness availability checks against block
+producers and full nodes to detect selective withholding.
+
+Sampling protocol:
+
+  WITNESS_SAMPLE_SIZE = 4   (samples per block, per sampling node)
+  WITNESS_SAMPLE_TIMEOUT = 10 seconds
+
+  For each new block received:
+
+    1. The sampling node selects WITNESS_SAMPLE_SIZE output IDs
+       uniformly at random from the block's new_outputs[].
+
+    2. For each selected output_id, the node sends a
+       GetWitnessBundle(output_id, block_height) request to the
+       block producer (identified by producer_address) and to one
+       randomly selected full node peer.
+
+    3. For each response received within WITNESS_SAMPLE_TIMEOUT:
+       - Verify the inclusion witness against the block header's
+         witness_bundle_root using the committed Merkle path.
+       - If valid: record success for that provider.
+       - If invalid or no response: record failure for that provider.
+
+    4. Peer scoring update:
+       - Each failed sample reduces the provider's peer score by
+         WITNESS_FAIL_PENALTY = 10 points.
+       - Each successful sample increases the provider's peer score
+         by WITNESS_SUCCESS_REWARD = 1 point.
+       - Asymmetric scoring makes withholding expensive: failing
+         one sample costs 10x more than passing one earns.
+       - Providers whose peer score drops below
+         WITNESS_DISCONNECT_THRESHOLD = -50 are disconnected and
+         banned for WITNESS_BAN_DURATION = 144 blocks (~4.8 hours).
+
+    5. Aggregate failure reporting:
+       If a sampling node observes >50% sample failure rate for a
+       specific block producer across 3 consecutive blocks, it
+       broadcasts a WitnessFailureReport:
+
+         WitnessFailureReport:
+           reporter_node_id    32 bytes
+           producer_address    32 bytes
+           failed_block_heights []  (up to 3)
+           failed_output_ids   []  (the specific samples that failed)
+           report_height        8 bytes
+
+       WitnessFailureReports are gossiped on the p2p network. They
+       are not consensus objects but inform other nodes' peer scoring
+       decisions.
+
+Why sampling works: a block producer who withholds witnesses for
+specific outputs cannot predict which outputs will be sampled. To
+avoid detection, the producer must serve all witnesses or risk
+random detection on any withheld output. At WITNESS_SAMPLE_SIZE = 4
+per block and N = 1,000 outputs, withholding witnesses for k outputs
+gives a detection probability of 1 - (1 - k/N)^4 per sampling node.
+Withholding 10% of witnesses: ~35% detection probability per node
+per block. With 100 sampling nodes across the network, the expected
+number of detections per block is ~35. Sustained withholding is
+statistically impossible to hide.
+
+Mechanism 3: Producer witness bond (economic enforcement)
+
+Block producers who wish to receive the full BLOCK_PRODUCER_FEE_SHARE
+must maintain a witness availability track record.
+
+  WITNESS_RELIABILITY_WINDOW = 100 blocks
+  WITNESS_RELIABILITY_THRESHOLD = 95%  (of sampled requests served)
+
+Each consensus full node maintains a local witness reliability score
+for each block producer it interacts with, based on its own sampling
+results over the most recent WITNESS_RELIABILITY_WINDOW blocks.
+
+Economic consequence:
+
+  Witness reliability scoring is a local node policy, not a consensus
+  rule. However, it directly affects the block producer's revenue
+  through miner selection behavior:
+
+    - Miners query connected full nodes for witness reliability
+      scores of competing block producers.
+    - A miner SHOULD prefer BlockCandidates from producers with
+      reliability scores above WITNESS_RELIABILITY_THRESHOLD.
+    - A block producer with poor witness reliability loses miner
+      preference, reducing their blocks-won rate and revenue.
+
+  This creates a market-based enforcement loop: block producers who
+  withhold witnesses lose revenue from miner selection, even though
+  no consensus rule directly penalizes them. The penalty is economic,
+  not cryptographic, and is proportional to the severity of
+  withholding.
+
+Combined enforcement model:
+
+  Layer 1 (consensus):    witness_bundle_root in header — block
+                          producer MUST compute valid inclusion
+                          witnesses or block is invalid.
+
+  Layer 2 (protocol):     availability sampling — probabilistic
+                          detection of withholding after block
+                          publication, with peer scoring consequences.
+
+  Layer 3 (economic):     miner preference based on witness
+                          reliability — sustained withholding reduces
+                          block producer revenue through market
+                          selection.
+
+This three-layer model moves witness availability from "please do it"
+to "you must compute it (consensus), we will check if you serve it
+(sampling), and you will lose money if you don't (miner preference)."
+
+Scope of commitment: witness_bundle_root commits to MMR inclusion
+witnesses only. The IMT non-membership proof (needed at spend time)
+depends on the spender's nullifier value, which derives from secret
+wallet material. Non-membership witnesses are therefore generated by
+the spending wallet against its chosen anchor state, not committed at
+output creation time. This is the correct separation: inclusion
+witnesses are a property of the output's existence in the MMR (public,
+deterministic), while non-membership witnesses are a property of the
+spend action (private, wallet-specific).
+
+The remaining gap: a block producer who computes valid inclusion
+witnesses (passing consensus) and serves them to sampling nodes
+(passing sampling) but selectively refuses to serve specific wallets.
+This is a targeted censorship attack at the serving layer. Defense
+relies on the secondary serving path (full node p2p obligation) and
+wallet peer diversity. This residual risk is comparable to Bitcoin's
+targeted block relay withholding and is not fully solvable without
+a data availability layer or erasure coding, which is out of scope
+for v1.
+
 
 Anchor rebasing
 
@@ -1023,13 +1340,41 @@ Rebasing procedure:
 
 Rebasing constraint: transition_hash binds to anchor_root. If
 anchor_root changes in a rebase, the auth_tag derived from
-auth_secret and transition_hash changes, requiring a partial
-re-run of the core circuit's authorization binding portion. This
-is significantly cheaper than full re-proving because the ownership
-and nullifier portions of the core circuit can be pre-committed and
-reused. Exact savings depend on the AIR implementation; implementers
-SHOULD structure the core circuit to allow partial re-execution of
-the auth_tag derivation without re-running the full witness relation.
+auth_secret and transition_hash changes. This requires re-proving the
+authorization binding.
+
+Implementation requirement: The core circuit MUST be factored into
+two independently provable sub-circuits composed via recursive proof
+verification:
+
+  Sub-circuit A (ownership + nullifier):
+    Proves knowledge of spend_root, null_root, and index n such that
+    owner_secret, address, null_secret, and nullifier are correctly
+    derived and consistent with the consumed output. Outputs a public
+    commitment to the intermediate values (owner_secret hash, nullifier)
+    that sub-circuit B consumes. This sub-circuit does NOT reference
+    transition_hash or auth_tag. Its proof is reusable across rebases.
+
+  Sub-circuit B (authorization binding):
+    Takes as public input the commitment from sub-circuit A, plus
+    auth_root, index n, and transition_hash. Proves that auth_secret
+    and auth_tag are correctly derived and that auth_tag binds to
+    transition_hash. Verifies sub-circuit A's proof recursively.
+
+On rebase, only sub-circuit B is re-proven. Sub-circuit A's proof is
+unchanged and reused as a recursive input to the new sub-circuit B
+proof. This avoids re-proving ownership and nullifier derivation.
+
+Cost: one recursive proof verification (sub-circuit A inside B) plus
+the auth_tag derivation constraints. This is approximately 20-30% of
+a full core circuit proof, depending on the ratio of ownership/
+nullifier constraints to auth_tag constraints.
+
+A monolithic core circuit that does not support this factoring will
+require full re-proving on every rebase where anchor_root changes.
+Implementations that use a monolithic core circuit MUST still produce
+correct results (full re-prove is the fallback) but will have
+degraded rebase performance.
 
 This reduces reproving events from "any chain movement" to "more than
 ANCHOR_WINDOW blocks passed," an approximate ANCHOR_WINDOW-fold
@@ -1391,14 +1736,18 @@ Fee and coinbase split rule (consensus-enforced):
 
   producer_fee     = (total_fragment_fees * BLOCK_PRODUCER_FEE_SHARE) / 100
   miner_fee        = total_fragment_fees - producer_fee
+  epoch_escrow     = (total_fragment_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
+  miner_fee_net    = miner_fee - epoch_escrow
 
   producer_subsidy = (scheduled_reward * BLOCK_PRODUCER_COINBASE_SHARE) / 100
   miner_reward     = scheduled_reward - producer_subsidy
 
-The miner receives miner_reward + miner_fee. The block producer
-receives producer_subsidy + producer_fee. The producer subsidy
-guarantees a minimum income from every block regardless of fee
-volume, solving the bootstrap problem for independent block producers.
+The miner receives miner_reward + miner_fee_net. The block producer
+receives producer_subsidy + producer_fee. The epoch_escrow is withheld
+from the miner's fee portion and accumulated toward the epoch prover
+bounty (see Epoch Proofs section). The producer subsidy guarantees a
+minimum income from every block regardless of fee volume, solving the
+bootstrap problem for independent block producers.
 
 Coinbase construction under fee split:
 
@@ -1406,7 +1755,7 @@ Each block produces two coinbase outputs:
 
   MinerCoinbase:
     address   = coinbase_address   (miner's receive address, from header)
-    value     = miner_reward + miner_fee
+    value     = miner_reward + miner_fee_net
     rho       = H("specter.coinbase.miner" || height || prev_hash)
 
   ProducerCoinbase:
@@ -1437,10 +1786,12 @@ Block validation step 8 (monetary correctness) is extended:
 
      producer_fee     = (total_fragment_fees * BLOCK_PRODUCER_FEE_SHARE) / 100
      miner_fee        = total_fragment_fees - producer_fee
+     epoch_escrow     = (total_fragment_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
+     miner_fee_net    = miner_fee - epoch_escrow
      producer_subsidy = (reward * BLOCK_PRODUCER_COINBASE_SHARE) / 100
      miner_reward     = reward - producer_subsidy
 
-     miner_coinbase_value    = miner_reward + miner_fee
+     miner_coinbase_value    = miner_reward + miner_fee_net
      producer_coinbase_value = producer_subsidy + producer_fee
 
      Verify both coinbase outputs match expected values.
@@ -1717,12 +2068,14 @@ A Specter block contains:
                                       included fragments; used by
                                       aggregated proof public inputs
                                       to bound the anchor window check
+      witness_bundle_root  32 bytes   Merkle root of WitnessBundles for
+                                      all new outputs in this block
       coinbase_address     32 bytes   miner's declared receive address
       producer_address     32 bytes   block producer's receive address
       nonce                 8 bytes
       difficulty_target     4 bytes
       ────────────────────────────────
-      Header total:        360 bytes
+      Header total:        392 bytes
 
     aggregated_block_proof   ~50-200 KB  (ephemeral, pruned after
                                           PROOF_RETENTION_WINDOW)
@@ -1767,6 +2120,16 @@ Header field notes:
     to reconstruct and verify both coinbase output commitments in
     the state_diff.
 
+  witness_bundle_root:
+    Merkle root of the inclusion witness commitments for all new
+    outputs created in this block (including both coinbase outputs).
+    The block producer MUST compute and include this root. Consensus
+    nodes reconstruct the root from the post-state MMR and verify it
+    matches. Any node that later receives an inclusion witness for an
+    output in this block can verify the witness against
+    witness_bundle_root without trusting the serving node. See
+    Witness Availability Enforcement section.
+
 The pre/post root pairs make state-transform semantics auditable:
 any node can independently verify declared post-roots follow from
 declared pre-roots by applying the included state_diff.
@@ -1809,9 +2172,11 @@ To validate a block, a node performs in order:
      reward = scheduled_reward(height)
      producer_fee     = (total_fragment_fees * BLOCK_PRODUCER_FEE_SHARE) / 100
      miner_fee        = total_fragment_fees - producer_fee
+     epoch_escrow     = (total_fragment_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
+     miner_fee_net    = miner_fee - epoch_escrow
      producer_subsidy = (reward * BLOCK_PRODUCER_COINBASE_SHARE) / 100
      miner_reward     = reward - producer_subsidy
-     miner_coinbase_value    = miner_reward + miner_fee
+     miner_coinbase_value    = miner_reward + miner_fee_net
      producer_coinbase_value = producer_subsidy + producer_fee
      Verify both coinbase outputs match expected values.
      Verify ProducerCoinbase is present when reward > 0.
@@ -1831,7 +2196,16 @@ To validate a block, a node performs in order:
           outputs in that epoch (enforced at spend time via check 8a).
         - epoch_cert_hash being any other value is invalid.
 
-All ten checks must pass. Proof verification (step 5) is one STARK
+  11. Witness bundle root
+      Verify witness_bundle_root is non-zero. For each output in
+      new_outputs[], compute the MMR inclusion path from the
+      post-state MMR (already computed in step 6), hash the
+      witness_leaf, and reconstruct the Merkle root. Verify the
+      reconstructed root matches the declared witness_bundle_root.
+      This check is fully deterministic and requires no secret
+      material. See Witness Availability Enforcement.
+
+All eleven checks must pass. Proof verification (step 5) is one STARK
 verification call: approximately 5-20 ms, independent of fragment
 count. This is the key verification asymmetry.
 
@@ -1849,7 +2223,6 @@ Where:
 
   fee_kernel = H(
     fragment_id ||
-    LE64(fee)   ||
     "specter.fee"
   )
 
@@ -1892,6 +2265,8 @@ Split computation:
 
   producer_fee     = (total_fragment_fees * BLOCK_PRODUCER_FEE_SHARE) / 100
   miner_fee        = total_fragment_fees - producer_fee
+  epoch_escrow     = (total_fragment_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
+  miner_fee_net    = miner_fee - epoch_escrow
   producer_subsidy = (reward * BLOCK_PRODUCER_COINBASE_SHARE) / 100
   miner_reward     = reward - producer_subsidy
 
@@ -1899,7 +2274,7 @@ Miner coinbase output:
 
   MinerCoinbase:
     address     32 bytes   coinbase_address from block header
-    value        8 bytes   miner_reward + miner_fee
+    value        8 bytes   miner_reward + miner_fee_net
     rho         32 bytes   H("specter.coinbase.miner" || height || prev_hash)
 
 Producer coinbase output (always present when reward > 0):
@@ -1923,9 +2298,9 @@ Coinbase output commitments:
   )
 
   producer_coinbase_cm = H(
-    producer_address    ||
-    LE64(producer_fee)  ||
-    producer_rho        ||
+    producer_address       ||
+    LE64(producer_value)   ||
+    producer_rho           ||
     "specter.output"
   )
 
@@ -2140,17 +2515,50 @@ blocks in the closing epoch are computed:
   epoch_total_fees = sum(total_fragment_fees for all blocks in epoch)
   epoch_prover_bounty = (epoch_total_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
 
-The epoch prover bounty is funded by a small share of the fragment
-fees that were already collected during the epoch. This share is
-deducted from the miner's portion of the fee split (not from the
-block producer's share), applied retroactively at epoch certification
-time. The deduction is spread equally across all blocks in the epoch.
+The epoch prover bounty is funded by a per-block escrow accumulated
+during the epoch and released at certification time.
+
+Funding mechanism (consensus-enforced):
+
+During each block in an epoch, a small fraction of the miner's fee
+share is withheld into a virtual epoch escrow:
+
+  per_block_escrow = (total_fragment_fees * EPOCH_PROVER_BOUNTY_SHARE) / 100
+
+This escrow is not paid to the miner at block time. Instead, the
+miner's coinbase value for each block is reduced by per_block_escrow:
+
+  miner_fee_after_escrow = miner_fee - per_block_escrow
+
+The escrowed amount is not a separate UTXO. It is an accounting
+reduction: the miner simply receives less. The total escrowed across
+the epoch equals epoch_prover_bounty.
+
+At the first block after the epoch boundary (the certification block),
+one of two outcomes occurs:
+
+  Certified: A valid EpochCertificate is submitted within
+    EPOCH_FINALIZATION_WINDOW. The accumulated escrow is materialized
+    as the EpochProverBounty output (see below). The escrow is fully
+    consumed.
+
+  Uncertified: No valid EpochCertificate appears within the window.
+    The escrowed fees are permanently burned (never materialized as
+    an output). The miner has already received the reduced coinbase;
+    the difference is lost. This provides an additional economic
+    penalty for uncertified epochs beyond EPOCH_DEBT_PENALTY: miners
+    lose the escrowed fee fraction permanently.
+
+This mechanism requires no retroactive modification of past outputs.
+Each block's coinbase is reduced at creation time. The escrow is
+forward-looking, not retroactive.
 
 Bounty distribution:
 
 The first valid EpochCertificate submitted within the
 EPOCH_FINALIZATION_WINDOW earns the bounty. The epoch boundary block
-includes a special bounty output:
+(or the first block that includes the valid EpochCertificate) includes
+a special bounty output:
 
   EpochProverBounty:
     address   = epoch_prover_address (declared in the EpochCertificate)
@@ -2223,7 +2631,7 @@ Historical bootstrapping with epoch proofs
 
 A new node syncing from genesis:
 
-  1. Downloads all block headers (360 bytes each, ~25 MB/year)
+  1. Downloads all block headers (392 bytes each, ~27 MB/year)
   2. Downloads all EpochCertificates (~13-26 MB/year)
   3. Verifies each EpochCertificate covers its epoch's headers
   4. Trusts only: PoW chain, epoch proof soundness, current state
@@ -2259,7 +2667,7 @@ After the proof retention window:
 Storage accounting:
 
   Permanent per-block storage:
-    Header:       360 bytes
+    Header:       392 bytes
     State diff:   ~156 KB per block at target throughput
     Epoch cert:   ~100 KB amortized per block (50-200 KB / 2016 blocks)
     Total:        ~156 KB per block permanent
@@ -2573,8 +2981,8 @@ NTT-dominated operations.
 Performance targets (engineering estimates, not consensus assumptions):
 
   Per-fragment proof generation:
-    CPU:   ~1-5 seconds
-    GPU:   ~0.5-2 seconds
+    CPU:   ~1-2 seconds
+    GPU:   ~0.3-0.8 seconds
 
   Aggregated block proof:
     Size:          ~50-200 KB
@@ -2694,8 +3102,12 @@ description of the system must name them all.
      epoch proofs to header_chain_root and block_proof_cm_root
   8. Correct implementation of all consensus rules, including
      epoch finalization modes, EPOCH_DEBT_PENALTY, epoch prover
-     bounty, and fee distribution
+     bounty, fee distribution, and witness_bundle_root validation
   9. Correct implementation of the wallet derivation scheme
+  10. Witness availability infrastructure: consensus-enforced inclusion
+      witness commitment (witness_bundle_root), availability sampling
+      protocol, and sufficient network peer diversity for secondary
+      witness paths
 
 
 /**** Adversarial Model ****/
@@ -2737,14 +3149,33 @@ recent validity evidence and cannot verify recent blocks directly.
 A wallet isolated from witness bundle providers cannot generate
 spend proofs regardless of cryptographic correctness.
 
-Mitigations: block producer witness serving obligation (primary source
-for newly created outputs), full node p2p witness serving obligation,
-peer diversity, multi-source witness verification (minimum 3 sources
-attempted), optional archival-proof retention by specialized nodes.
-Witness serving is attached to already-incentivized roles (block
-producers via fee split, full nodes via standard participation).
-Residual risk: eclipse attacks on wallet peers remain a real
-operational risk comparable to Bitcoin's block relay eclipse.
+Mitigations: three-layer witness availability enforcement (see
+Witness Availability Enforcement section):
+  - Layer 1: witness_bundle_root in block header (consensus-enforced
+    computation of valid MMR inclusion witnesses for all new outputs).
+  - Layer 2: witness availability sampling with asymmetric peer
+    scoring (probabilistic detection of withholding, 10:1 penalty
+    ratio, automatic disconnection at threshold).
+  - Layer 3: miner preference for producers with high witness
+    reliability scores (economic penalty via reduced block selection).
+Note: witness_bundle_root commits to inclusion witnesses only. IMT
+non-membership witnesses depend on secret nullifier values and are
+generated by the spending wallet at spend time.
+Additional mitigations: mandatory four-tier witness fetch cascade
+(block producer -> direct full node peers -> gossip relay layer ->
+fallback full node connection), mandatory multi-source cross-
+verification, peer diversity, optional archival-proof retention by
+specialized nodes. The relay layer (Tier 3) extends witness
+reachability beyond the wallet's direct peer set, making targeted
+eclipse attacks significantly harder: the attacker must control not
+just the wallet's direct peers but also all nodes within
+WITNESS_RELAY_TTL hops.
+Residual risk: targeted withholding against specific wallets while
+serving all sampling nodes remains possible if the attacker controls
+all reachable nodes within the relay radius. Defense relies on relay
+path diversity and Tier 4 fallback to bootstrap nodes outside the
+attacker's reach. This residual risk is comparable to Bitcoin's
+targeted block relay withholding.
 
 3. Epoch proof withholding
 
@@ -2860,9 +3291,13 @@ Rolling witness cache
 
 The wallet maintains a spending-ready state for all owned outputs:
 
-  - on output receipt: immediately request WitnessBundle from a full
-    node or witness relay
-  - periodically: refresh WitnessBundle as the accumulator advances
+  - on output receipt: fetch WitnessBundle via the witness fetch
+    cascade (Tier 1: block producer, Tier 2: full node peers,
+    Tier 3: relay, Tier 4: fallback). Cross-verify against at
+    least two independent sources.
+  - periodically: refresh WitnessBundle as the accumulator advances,
+    using the same cascade. Cache the most recent valid witness for
+    each owned output.
   - background: verify freshness, rebase anchor if needed
 
 To receive
@@ -2894,8 +3329,11 @@ Wallet policies (MUST):
   - prove locally by default
   - require explicit user confirmation before delegated proving
   - maintain rolling witness cache for all owned outputs
+  - fetch witnesses via the four-tier cascade (see Witness Bundle
+    Protocol) and cross-verify from at least two independent sources
   - support anchor rebasing without full reproving
   - track intent expiry and notify user of timeout
+  - log witness fetch failures per tier for local peer scoring
 
 Wallet policies (SHOULD):
 
@@ -2918,7 +3356,8 @@ Verification is O(1) in fragment count regardless of block fullness.
 Permanent canonical storage
 
   Per block:
-    Header:             360 bytes   (296 + 32 coinbase + 32 producer)
+    Header:             392 bytes   (296 + 32 witness_bundle_root +
+                                     32 coinbase + 32 producer)
     New nullifiers:     1,000 x 32  = 32,000 bytes
     New outputs:        1,002 x 104 = 104,208 bytes  (1,000 + 2 coinbases)
     Fee entries:          500 x 40  = 20,000 bytes   (32 kernel + 8 amount)
@@ -2971,8 +3410,13 @@ storage cost is paid in nullifiers, not signatures.
   - script-based programmability
   - formally machine-checked AIR correctness (required before mainnet)
   - decentralization guarantees stronger than its hardware asymmetries
-  - consensus-enforced witness serving (block producer obligation and
-    full node p2p serving are protocol expectations, not slashable rules)
+  - targeted witness withholding resistance (MMR inclusion witness
+    computation is consensus-enforced via witness_bundle_root, serving
+    availability is probabilistically enforced via sampling, and wallet
+    fetch uses a mandatory four-tier cascade with relay gossip, but
+    targeted withholding against a wallet whose entire relay radius is
+    attacker-controlled is not fully preventable without a data
+    availability layer)
 
 
 /**** Open Problems ****/
@@ -2987,6 +3431,40 @@ The spend circuit AIR must be formally specified and machine-checked
 against the intended consensus semantics before any production claim
 is valid. No protocol that uses ZK for consensus-critical authorization
 can skip this step. This is the primary pre-mainnet requirement.
+
+Implementation path for formal AIR audit:
+
+  Phase 1 — Reference circuit in executable specification:
+    Write the W1/W2/W3 circuits as a standalone Rust implementation
+    against the Plonky3 AIR trait interface. Each constraint relation
+    must be individually testable with known-good and known-bad
+    witnesses. Target: complete executable spec with >95% branch
+    coverage on constraint satisfaction tests.
+
+  Phase 2 — Property-based testing harness:
+    Use randomized witness generation to fuzz every constraint path.
+    For each circuit: generate 10^6+ random valid witnesses and verify
+    proof acceptance; generate 10^6+ invalid witnesses (each violating
+    exactly one constraint) and verify proof rejection. Any accepted
+    invalid witness is a soundness bug.
+
+  Phase 3 — Machine-checked specification:
+    Translate the constraint system into a formal verification language
+    (Lean 4 or Coq). Prove that the AIR constraints are equivalent to
+    the intended consensus semantics: ownership, nullifier correctness,
+    authorization binding, value conservation, and state root
+    consistency. This is the hard step and may require dedicated
+    formal methods expertise.
+
+  Phase 4 — External audit:
+    Commission at minimum two independent audits of the circuit AIR
+    from firms with demonstrated ZK circuit audit capability (e.g.,
+    Trail of Bits, Zellic, OtterSec, or comparable). Audits must
+    cover both the constraint system and the recursive aggregation
+    circuit.
+
+  No testnet launch without Phase 2 complete. No mainnet launch
+  without Phase 3 and Phase 4 complete.
 
 2. Nullifier set growth
 
@@ -3067,6 +3545,86 @@ delegated during assembly, and proving that the tiering does not
 create double-spend vectors at the hot/cold boundary. This is
 earmarked for v2 scope.
 
+Implementation specification for v2 nullifier tiering:
+
+  Data structures:
+
+    HotIMT:
+      Standard depth-32 Indexed Merkle Tree.
+      Contains nullifiers from epochs [current - N_HOT, current].
+      Maintained in RAM by all consensus full nodes.
+      N_HOT = 4 epochs (~11.2 days at 120-second blocks).
+
+    ColdEpochIndex:
+      Array of (epoch_index, epoch_spentness_cm) pairs.
+      One entry per epoch older than N_HOT.
+      Stored on disk. Total size: ~4 KB/year.
+
+    ColdArchive (archival nodes only):
+      Per-epoch sorted nullifier lists, stored on disk.
+      Each list is a flat array of 32-byte nullifiers in ascending
+      order, with a Merkle root matching the epoch_spentness_cm.
+      Total size: ~8.5 GB/year (same as current nullifier growth,
+      but on disk instead of in RAM).
+
+  Hot/cold boundary protocol:
+
+    At each epoch boundary (height mod EPOCH_LENGTH == 0):
+
+      1. Compute epoch_spentness_cm for the epoch that is falling
+         out of the hot window (epoch current - N_HOT - 1).
+      2. Write the sorted nullifier list for that epoch to disk
+         (archival nodes) or discard it (non-archival nodes that
+         trust the commitment).
+      3. Remove that epoch's nullifiers from the HotIMT.
+      4. Append (epoch_index, epoch_spentness_cm) to ColdEpochIndex.
+
+    The HotIMT is rebuilt from scratch at each hot/cold rotation.
+    This is O(N_HOT * nullifiers_per_epoch) hash operations, which
+    at N_HOT = 4 and ~1M nullifiers per epoch is approximately
+    4M hash operations — under 1 second with BLAKE3 at 3 GB/s.
+
+  Double-spend prevention at the hot/cold boundary:
+
+    A fragment proof targets the HotIMT root. The fragment's
+    non-membership proof demonstrates the nullifier is absent from
+    the hot tier. But the nullifier could exist in a cold epoch
+    (a double-spend of an old output).
+
+    Block producer obligation:
+      For every fragment that passes hot-tier non-membership
+      verification, the block producer MUST check the nullifier
+      against ALL cold epochs before including it in a block.
+
+    Cold-tier check implementation:
+      Option A — Bloom filter pre-check:
+        Maintain a single Bloom filter over all cold-tier
+        nullifiers. False positive rate target: 10^-6. At 100M
+        cold nullifiers: ~240 MB Bloom filter. A negative result
+        proves absence. A positive result requires a full cold
+        archive lookup.
+
+      Option B — Epoch-partitioned sorted arrays with binary search:
+        For each cold epoch, maintain a sorted array on disk.
+        Binary search each array: O(log M) per epoch per nullifier.
+        At 100 cold epochs and 1M nullifiers per epoch:
+        100 * log2(1M) = ~2000 comparisons. With memory-mapped
+        files this completes in microseconds.
+
+      Recommended: Option A for the fast path, Option B as fallback
+      for Bloom-positive cases. Both are non-consensus (the block
+      producer performs them before block assembly; the consensus
+      rule is simply that no nullifier appears twice in the
+      canonical chain).
+
+    Consensus enforcement:
+      The existing consensus rule (no duplicate nullifiers) does
+      not change. Tiering is a storage optimization, not a consensus
+      change. If a block producer includes a cold-tier duplicate
+      nullifier, epoch proof generation for that epoch will fail
+      because the state transition is invalid. The penalty falls
+      on the block producer whose block included the duplicate.
+
 3. Block producer centralization
 
 Competitive proof aggregation requires GPU-class hardware. Block
@@ -3080,25 +3638,51 @@ away.
 4. Witness infrastructure resilience
 
 Witness serving is part of spend availability, not ancillary
-infrastructure. v1.3 addresses the primary incentive gap from earlier
-drafts by attaching witness serving to the block producer role (which
-is already compensated via the fee split) and defining full node
-witness serving as a p2p protocol obligation.
+infrastructure. The three-layer Witness Availability Enforcement
+model (see dedicated section) substantially strengthens witness
+availability guarantees compared to earlier drafts:
 
-What v1.3 specifies: wire format (WitnessBundle), self-verification
-semantics, block-producer serving obligation for included outputs,
-full-node p2p serving obligation, multi-source verification policy.
+  - MMR inclusion witness computation is now consensus-enforced via
+    witness_bundle_root in the block header (Layer 1).
+  - Inclusion witness serving is probabilistically verified via
+    availability sampling with asymmetric peer scoring (Layer 2).
+  - Sustained withholding carries economic penalties through miner
+    preference for high-reliability producers (Layer 3).
 
-Residual risk: the block producer obligation covers newly created
-outputs but does not guarantee long-term witness freshness for outputs
-that remain unspent across many blocks. Full node p2p serving covers
-this gap in practice, but the p2p obligation is not consensus-enforced
-and relies on peer scoring. A well-resourced attacker who eclipses a
-wallet from all full node peers could still delay or prevent spending.
+What is now specified: wire format (WitnessBundle), self-verification
+semantics, consensus-enforced inclusion witness commitment (covering
+MMR inclusion paths; IMT non-membership witnesses are wallet-
+generated at spend time), mandatory four-tier wallet fetch cascade
+with relay gossip (RelayWitnessRequest wire format, TTL-bounded
+propagation, dedup rules), mandatory multi-source cross-verification,
+availability sampling protocol with detection probability analysis,
+peer scoring with asymmetric penalties, WitnessFailureReport gossip,
+miner selection preference based on reliability scores.
 
-This residual risk is comparable to Bitcoin's block relay eclipse
-attack: a real operational risk but not a cryptographic failure mode.
-Defense relies on peer diversity, not protocol enforcement.
+On the wallet side, the mandatory four-tier witness fetch cascade
+(block producer -> full node peers -> gossip relay -> fallback
+bootstrap) with mandatory multi-source cross-verification ensures
+that a wallet exhausts all reachable network paths before declaring
+unavailability. The relay tier extends reachability beyond direct
+peers, requiring an attacker to eclipse the wallet's entire
+WITNESS_RELAY_TTL-hop neighborhood to succeed at targeted
+withholding.
+
+Residual risk (narrowed): the block producer obligation now covers
+inclusion witness computation (consensus-enforced) and broad serving
+(sampling-enforced). The wallet cascade covers fetch resilience
+(mandatory four tiers with relay gossip and cross-verification). The
+remaining gap is targeted withholding against a wallet whose entire
+relay radius is attacker-controlled while the attacker serves all
+sampling nodes correctly. This is a substantially narrower attack
+surface than the original "please serve witnesses" design.
+
+Long-term witness freshness for outputs that remain unspent across
+many blocks depends on full node p2p serving, which is protocol-
+expected but not consensus-enforced. Witness staleness does not
+prevent spending (wallets rebase witnesses from any current full
+node) but does add latency if the wallet must fetch fresh witnesses
+at send time rather than using its rolling cache.
 
 5. Epoch prover coordination
 
@@ -3108,8 +3692,79 @@ of epoch fees) provides direct economic motivation. The
 EPOCH_FINALIZATION_WINDOW (144 blocks, ~4.8 hours) provides buffer.
 Residual risk: if multiple provers race to produce the certificate,
 only the first submission earns the bounty, potentially creating
-wasted computation. A future version may introduce a commitment
-scheme where provers signal intent before beginning computation.
+wasted computation.
+
+Epoch prover commitment scheme (specified for v2 implementation):
+
+  The scheme uses a commit-reveal pattern to reduce duplicate proving
+  work without introducing a trusted coordinator.
+
+  EpochProverCommitment:
+    commitment_id     = H("specter.epoch-commit" || epoch_index ||
+                          prover_address || commitment_nonce)
+    epoch_index        8 bytes
+    prover_address    32 bytes
+    commitment_nonce  32 bytes   (random, revealed later)
+    committed_height   8 bytes   (block height at which commitment
+                                  was broadcast)
+
+  Protocol:
+
+    1. At epoch boundary (height H_e where H_e mod EPOCH_LENGTH == 0):
+       The epoch prover window opens. Any prover may broadcast an
+       EpochProverCommitment to the p2p network.
+
+    2. Commitment visibility window:
+       EPOCH_COMMITMENT_WINDOW = 12 blocks (~24 minutes).
+       Commitments broadcast after H_e + EPOCH_COMMITMENT_WINDOW
+       are not eligible for the coordination protocol (but the
+       prover can still submit a certificate and earn the bounty
+       if no earlier certificate exists).
+
+    3. Commitment deduplication:
+       Nodes maintain a set of commitment_ids for the current epoch.
+       Duplicate commitment_ids are silently dropped. Multiple
+       commitments from distinct provers are all retained.
+
+    4. If exactly one commitment is observed within the window:
+       That prover has signaled exclusive intent. Other provers
+       SHOULD defer (not MUST — this is a coordination signal,
+       not a consensus rule). The committed prover has the full
+       EPOCH_FINALIZATION_WINDOW to submit the certificate.
+
+    5. If multiple commitments are observed:
+       All committed provers proceed. The first valid certificate
+       submission earns the full bounty. This is the current v1
+       behavior, which the commitment scheme does not override in
+       the contested case.
+
+    6. If zero commitments are observed within the window:
+       Any prover may submit a certificate at any time within
+       EPOCH_FINALIZATION_WINDOW. The commitment scheme provides
+       no benefit in this case but also creates no harm.
+
+  Bounty split for contested epochs (optional v2 extension):
+
+    If the epoch is contested (multiple commitments observed) and
+    a valid certificate is submitted, the bounty MAY be split:
+
+      first_prover_share  = 80% of epoch_prover_bounty
+      commitment_pool     = 20% of epoch_prover_bounty
+
+    The commitment_pool is divided equally among all provers who
+    submitted a valid EpochProverCommitment within the window,
+    as partial compensation for wasted computation. This reduces
+    the all-or-nothing risk that discourages smaller provers from
+    participating.
+
+    The split is consensus-enforced if adopted. The bounty output
+    is replaced by multiple outputs (one per eligible prover),
+    each following the standard output model.
+
+  This scheme is a coordination mechanism, not a consensus
+  requirement. Epochs can be certified without any commitments
+  being broadcast. The scheme reduces wasted work in the common
+  case where one prover is sufficient and multiple are willing.
 
 6. Long-range attack surface
 
@@ -3128,7 +3783,7 @@ header_chain_root than what appears in the canonical headers for
 epoch E.
 
 The canonical headers for epoch E are not discarded. Block headers
-are permanent (360 bytes each, ~24 MB/year). Any node that has the
+are permanent (392 bytes each, ~27 MB/year). Any node that has the
 canonical header chain for epoch E can verify that an EpochCertificate
 claims header_chain_root consistent with those headers. A forged cert
 over different state transitions would need to claim a different
@@ -3397,9 +4052,11 @@ the base-layer proving bound.
 5. Epoch prover coordination refinement
 
 The v1.3 epoch prover bounty provides basic economic incentives for
-certificate production. Future versions may add a commitment scheme
-(provers announce intent before proving, reducing duplicate work) or
-a multi-prover reward split for partial proofs.
+certificate production. The epoch prover commitment scheme (specified
+in Open Problem 5) defines a commit-reveal coordination protocol and
+an optional contested-epoch bounty split (80/20) for v2. Implementation
+requires p2p message types for EpochProverCommitment relay and
+consensus validation of bounty split outputs when the split is adopted.
 
 6. Dynamic fragment cap
 
@@ -3447,7 +4104,7 @@ Fully specified (implementable from this document):
   - MMR accumulator role with batch append
   - IMT nullifier role with pre-sorted batch insertion
   - coinbase output structure and COINBASE_MATURITY
-  - block structure (header 360 bytes, state_diff, proof, epoch_cert_hash)
+  - block structure (header 392 bytes, state_diff, proof, epoch_cert_hash)
   - same-block spend rule
   - two-role block production (block producer / miner) with fee split
   - aggregation tree with canonical padding for non-power-of-2 counts
@@ -3518,7 +4175,8 @@ What Specter uses instead
   - epoch compression proofs for historical validity
   - anchor-window binding for practical mempool economics
   - two-phase spend path for UX
-  - witness bundle protocol for censorship-resistant send preparation
+  - witness bundle protocol with four-tier fetch cascade and relay
+    gossip for censorship-resistant send preparation
   - two-role block production with consensus-enforced fee distribution
 
 What Specter buys
@@ -3564,10 +4222,11 @@ provably verifiable through compact epoch certificates.
 
 This comes at a price.
 
-Proof generation costs 1-5 seconds. Nullifier state grows permanently.
-Block production hardware is asymmetric. The epoch prover infrastructure
-requires ongoing operation and explicit economic incentives. The circuit AIR must be formally audited
-before deployment.
+Proof generation costs 0.3-2 seconds (GPU typical 0.3-0.8s, CPU
+fallback 1-2s). Nullifier state grows permanently. Block production
+hardware is asymmetric. The epoch prover infrastructure requires
+ongoing operation and explicit economic incentives. The circuit AIR
+must be formally audited before deployment.
 
 These are not defects in the prose. They are the actual engineering
 costs of this architecture.
