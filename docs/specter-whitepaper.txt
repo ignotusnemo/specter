@@ -309,17 +309,9 @@ Concrete cost estimates:
   At 1 GHz quantum clock speed:    ~585 years of continuous operation
   At 1 THz quantum clock speed:    ~213 days of continuous operation
 
-  Physical qubit cost per logical qubit (surface code, 10^-3 error
-  rate): ~1,000-3,000 physical qubits per logical qubit.
-
   Estimated logical qubits for Grover on Poseidon2: ~500-2,000
-  Estimated physical qubits: ~500,000 to 6,000,000
-
-  For comparison: IBM's 2025 roadmap targets ~100,000 physical qubits.
-  Google's Willow processor: 105 physical qubits (2024).
-
-  Estimated cost at projected 2035 quantum computing prices:
-  ~$10^9 to $10^12 per attack (order-of-magnitude estimate).
+  (requiring orders of magnitude more physical qubits under surface
+  code error correction — well beyond near-term hardware roadmaps).
 
 What a successful PSC-64 attack would yield: one forged proof for
 one false statement. The attacker does not gain long-term advantage:
@@ -343,7 +335,7 @@ The distinction between WSC-128 and PSC-64 is not a weakness to be
 hidden but a deliberate engineering tradeoff: higher in-circuit
 security (wider field) would increase proving cost for every
 transaction, paid by every user, to defend against an attack that
-currently costs billions of dollars per instance.
+remains far beyond feasible quantum hardware capabilities.
 
 Any future upgrade that raises in-circuit security would require only
 a circuit change, not a protocol redesign.
@@ -1830,85 +1822,31 @@ either parameter based on observed proving costs, fee levels, and
 network conditions.
 
 
-/**** Block Production Economics ****/
+/**** Block Production Economics — Structural Properties ****/
 
-Cost structure analysis (2025-2026 estimates, based on real benchmarks):
+Three structural properties of the dual-split model, independent of
+specific hardware prices or token valuation:
 
-  Proving cost (recursive STARK aggregation, ~500 fragments):
-    GPU class       : A100 / H100 (or consumer RTX 4090/5090)
-    Per-proof cost  : ~$0.02 (Succinct SP1 Hypercube benchmark)
-    Per-tx cost     : ~$0.004 (zkSync Era at scale)
-    Total per block : $0.01 - $0.10 (baseline ~$0.05)
-    Trend           : falling rapidly (Circle STARKs, S-two prover,
-                      hardware acceleration, prover competition)
+  1. Proving cost is negligible relative to mining cost. Per-block
+     recursive STARK aggregation costs orders of magnitude less than
+     the PoW expenditure that determines block_reward. The proving/
+     mining cost ratio is < 0.1% and falling as prover technology
+     improves. The coinbase subsidy compensates for infrastructure
+     investment (GPU hardware, bandwidth), not per-block marginal
+     proving cost.
 
-  Mining cost (PoW, at equilibrium):
-    Hardware + electricity per block: $80 - $120 (baseline ~$100)
+  2. The coinbase subsidy provides a revenue floor independent of fee
+     volume. During low-fee phases (early network, low activity), the
+     subsidy alone exceeds proving cost by orders of magnitude. This
+     ensures that operating a standalone block producer node remains
+     viable without requiring vertically integrated mining — preventing
+     centralization pressure at the producer layer.
 
-  Cost ratio:
-    proving / total  < 0.1%  (proving cost is negligible vs. mining)
-
-Revenue analysis under the dual-split model:
-
-  Assume: block_reward = $100, total_fees = $20
-
-  Producer revenue:
-    coinbase subsidy = 10% * $100 = $10.00
-    fee share        = 30% * $20  = $6.00
-    total            = $16.00
-
-  Miner revenue:
-    coinbase share   = 90% * $100 = $90.00
-    fee share        = 70% * $20  = $14.00
-    total            = $104.00
-
-  Producer margin at baseline proving cost ($0.05):
-    $16.00 - $0.05 = +$15.95  (highly profitable)
-
-  Producer margin at zero fees (early network):
-    coinbase subsidy only = $10.00
-    $10.00 - $0.05 = +$9.95  (profitable from subsidy alone)
-
-This model reveals three important dynamics:
-
-  1. Proving cost is NOT the bottleneck. At $0.01-$0.10 per block,
-     the computational cost of proof generation is trivial. The real
-     cost of running a block producer is infrastructure: GPU hardware
-     purchase/lease ($24K-$120K for a competitive cluster), bandwidth
-     for mempool monitoring, and operational overhead. The coinbase
-     subsidy compensates for this infrastructure investment, not for
-     per-block marginal proving cost.
-
-  2. The subsidy justifies infrastructure commitment. A block producer
-     who invests $50K in GPU hardware needs predictable revenue to
-     justify that capital expenditure. The coinbase subsidy ($10 per
-     block at $100 reward) provides ~$1,440/day at 144 blocks/day,
-     covering hardware costs and ensuring multiple independent
-     producers can compete rather than a single integrated operator.
-
-  3. Vertical integration: A miner-builder who performs both roles
-     captures 100% of both coinbase and fees. This is always more
-     profitable than separation. The split parameters ensure that
-     separation is VIABLE, not that it is optimal. The market will
-     contain a mix of integrated operators and specialized builders,
-     with the ratio determined by hardware economics.
-
-Producer break-even analysis:
-
-  Per-block proving cost is negligible (~$0.05). The real question
-  is whether producer revenue covers infrastructure amortization.
-
-  At 144 blocks/day, $100 reward, $20 avg fees:
-    daily producer revenue = 144 * $16 = $2,304
-    annual producer revenue = ~$841K
-
-  At 144 blocks/day, $100 reward, $0 fees (early network):
-    daily producer revenue = 144 * $10 = $1,440
-    annual producer revenue = ~$526K
-
-  A competitive GPU cluster ($50K-$120K) is paid off within months
-  even in the zero-fee scenario. The subsidy makes independent block
-  production viable from day one.
+  3. Vertical integration (miner-builder) always captures more revenue
+     than separation. The split parameters ensure separation is VIABLE,
+     not that it is optimal. The market will contain a mix of integrated
+     operators and specialized builders, with the ratio determined by
+     prevailing hardware economics.
 
 
 /**** Block Production Market Structure ****/
@@ -2584,8 +2522,7 @@ a 2,016-block epoch generates approximately:
   epoch_prover_bounty ~ 1,008 x 0.05 = ~50.4 SPEC
 
 This is sufficient to cover the GPU cost of recursive epoch proof
-generation (estimated at $5-50 per epoch at current hardware prices)
-while representing only 5% of total epoch fee revenue.
+generation while representing only 5% of total epoch fee revenue.
 
 If the epoch is uncertified (no valid EpochCertificate produced), the
 bounty is not paid and the fees remain with the original recipients.
@@ -3835,137 +3772,42 @@ broader formal AIR correctness requirement (Open Problem 1) and
 should be treated as such.
 
 
-/**** Performance Optimizations ****/
+/**** Implementation Requirements for Block Production ****/
 
-This section specifies performance optimizations that are protocol-
-compatible and expected of conforming implementations. They are not
-optional for block-producing nodes: violating them means failing to
-produce blocks within the block time.
+The following requirements are consensus-critical. Violating them
+means producing invalid blocks or failing to meet block time targets.
 
-1. Parallel batched fragment verification
+1. Parallel fragment verification: Block producers MUST verify all N
+   per-fragment proofs in parallel before beginning any aggregation
+   step. No aggregation level begins until all leaf proofs are
+   verified. Implementations choose their parallelism strategy (GPU
+   batched kernel, CPU thread-pool, etc.) but serial verification of
+   N ~ 500 proofs will not meet block time.
 
-Before beginning binary tree aggregation, the block producer holds N
-per-fragment proofs. Each proof verification is independent of all
-others. Block producers MUST verify all N fragment proofs in parallel
-before beginning any aggregation step.
+2. Canonical nullifier ordering: The block producer MUST pre-sort
+   new_nullifiers[] in ascending numeric order before including them
+   in the BlockCandidate. This is the canonical IMT insertion order,
+   the storage order, and the order block validators apply. Sorted
+   batch insertion amortizes IMT path operations from O(N log N) to
+   approximately O(N + log N).
 
-On GPU hardware (ICICLE backend), all N verifications SHOULD be
-dispatched as a single batched kernel call. The GPU kernel schedules
-N independent verification pipelines across available compute units.
-At N = 500 and ~5 ms per verification single-threaded, naive serial
-verification would take 2.5 seconds. Batched GPU verification at
-500x parallelism reduces this to the latency of a single verification
-plus scheduling overhead: approximately 10-30 ms total.
+3. MMR batch append: Implementations MUST use batch append for all
+   block-level MMR updates. Given M new leaves, the final peak
+   structure is computed in O(M) hash operations. Per-output
+   sequential appending is not permitted in block-producing or
+   block-validating code.
 
-On CPU, implementations SHOULD use thread-pool parallelism with one
-verification per thread. With 16 CPU cores: 500 verifications at
-20 ms each = 625 ms wall-clock (acceptable as a pre-aggregation step
-on a CPU-only fallback node, though GPU is required for target
-throughput).
+4. Aggregation-level parallelism: Within each level of the binary
+   tree aggregation, all pairwise aggregations are independent.
+   Implementations SHOULD dispatch each level as a parallel batch
+   rather than running all ceil(log2(K)) * K/2 aggregations serially.
 
-The proof verification step precedes the aggregation tree. No
-aggregation level begins until all leaf proofs are verified.
-
-2. IMT nullifier pre-sorting for batch insertion
-
-Inserting N nullifiers into the IMT sequentially is O(N log N) in
-path operations, with each insertion requiring a tree path traversal
-to find the insertion point. The IMT's sorted structure allows a
-more efficient batch strategy.
-
-The block producer already possesses the full set of new_nullifiers[]
-for the block before the state_diff is finalized. The block producer
-MUST pre-sort new_nullifiers[] in ascending order before including
-them in the BlockCandidate.
-
-Benefit: when the node applies the sorted nullifier list to the IMT,
-it can use a sequential scan strategy rather than individual binary
-searches for each insertion. Consecutive insertions into nearby
-positions in the sorted tree share subtree paths, enabling node
-reuse across multiple insertions. This reduces the number of distinct
-tree node reads for a batch of N sorted insertions from O(N log N)
-individual reads to approximately O(N + log N) amortized reads for
-a sorted batch, a significant practical speedup at N = 500-1000
-per block.
-
-The canonical ordering of new_nullifiers[] in the state_diff is
-ascending numeric value. This is both the IMT insertion order and
-the storage order. Block validators apply nullifiers in this order.
-
-3. MMR batch append
-
-Each block appends up to 1,000 new output commitments to the MMR.
-Naive sequential appending updates the MMR peak structure 1,000
-times with intermediate root recomputations that are discarded.
-
-The MMR supports efficient batch appending: given a batch of M new
-leaves, the final peak structure can be computed in O(M) hash
-operations by processing all new leaves simultaneously.
-
-Algorithm (batch MMR append for M new leaves):
-
-  1. Represent the current MMR as its peak list: a set of perfect
-     binary trees at heights h_0 > h_1 > ... > h_k where each
-     height has exactly one peak.
-  2. Append all M new leaves to a pending list.
-  3. While the pending list contains two trees at the same height,
-     merge them into a tree one height taller (one hash operation).
-  4. Merge the pending list with the existing peak list using the
-     same height-merge rule.
-  5. Compute the new MMR root as the hash of all remaining peaks.
-
-This requires exactly M - 1 + (merges into existing peaks) hash
-operations, versus up to M * log(N) hash operations for sequential
-appending. At M = 1,000 and N = 100,000,000: batch requires ~1,000
-hashes; sequential requires ~27,000 hashes. A 27x reduction.
-
-Implementations MUST use batch append for all block-level MMR
-updates. Per-output sequential appending is not permitted in block-
-producing or block-validating code.
-
-4. Aggregation pipeline overlap
-
-The binary tree aggregation has ceil(log2(K)) sequential levels, but
-within each level all pairwise aggregations are independent. GPU
-implementations SHOULD exploit this by:
-
-  - Dispatching all pairwise aggregations at a given level as a
-    single batched GPU kernel.
-  - Beginning the next level's kernel dispatch as soon as the
-    current level's outputs are available.
-  - Overlapping proof I/O (loading proof blobs from memory) with
-    GPU computation using CUDA streams or equivalent.
-
-At K = 512 (9 levels), naive sequential pairwise aggregation would
-run 511 aggregations in series. Level-parallel dispatch runs 256
-aggregations in the first batch, 128 in the second, etc. — 9 GPU
-dispatches total. If a single aggregation takes 200 ms on GPU, the
-sequential approach takes ~102 seconds; the level-parallel approach
-takes ~9 x 200 ms = ~1.8 seconds (idealized; actual performance
-depends on parallelism within each level's batch).
-
-5. Witness bundle prefetching optimization
-
-Full nodes SHOULD prefetch and maintain updated WitnessBundles for
-all outputs in their local mempool (outputs referenced by active
-SpendIntents). When the chain advances by one block:
-
-  - All MMR paths for existing outputs gain one position in the MMR.
-  - Non-membership paths for uncreated nullifiers remain valid if
-    no new nullifier from the new block falls between L.value and
-    R.value in the IMT sorted order.
-
-For the majority of outputs in the mempool, the non-membership
-witness remains valid across block boundaries. Only outputs whose
-IMT witnesses are invalidated by a new nullifier insertion require
-a full witness refresh. Nodes SHOULD compute which IMT witnesses
-are invalidated by each new block's nullifier set and send targeted
-witness refresh bundles only to wallets whose witnesses were
-affected, rather than broadcasting fresh witnesses for all outputs.
-
-This reduces witness relay bandwidth from O(N_mempool) per block to
-O(N_invalidated) per block, where N_invalidated << N_mempool in
-normal operation.
+5. Witness bundle prefetching: Full nodes SHOULD maintain updated
+   WitnessBundles for mempool outputs and perform targeted witness
+   refresh only for outputs whose IMT non-membership witnesses are
+   invalidated by a new block's nullifier insertions, rather than
+   broadcasting fresh witnesses for all outputs. This reduces witness
+   relay bandwidth from O(N_mempool) to O(N_invalidated) per block.
 
 
 /**** Future Work ****/
